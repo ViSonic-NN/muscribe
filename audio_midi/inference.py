@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from . import config
+from . import config, models
 from .pytorch_utils import forward
 from .utilities import RegressionPostProcessor, create_folder, write_events_to_midi
 
@@ -51,8 +51,7 @@ class PianoTranscription(object):
         self.pedal_offset_threshold = 0.2
 
         # Build model
-        Model = eval(model_type)
-        self.model = Model(
+        self.model = getattr(models, model_type)(
             frames_per_second=self.frames_per_second, classes_num=self.classes_num
         )
 

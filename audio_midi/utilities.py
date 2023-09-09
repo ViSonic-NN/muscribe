@@ -1,7 +1,7 @@
 import os
 
 import audioread
-import librosa
+import librosa.core.audio as rosa_audio
 import numpy as np
 from mido import MidiFile
 
@@ -480,8 +480,6 @@ class RegressionPostProcessor(object):
                [1.1400, 2.6458],
                ...]
         """
-        frames_num = output_dict["pedal_frame_output"].shape[0]
-
         est_tuples = pedal_detection_with_onset_offset_regress(
             frame_output=output_dict["pedal_frame_output"][:, 0],
             offset_output=output_dict["pedal_offset_output"][:, 0],
@@ -586,7 +584,7 @@ def load_audio(
         n = 0
 
         for frame in input_file:
-            frame = librosa.core.audio.util.buf_to_float(frame, dtype=dtype)
+            frame = rosa_audio.util.buf_to_float(frame, dtype=dtype)
             n_prev = n
             n = n + len(frame)
 
@@ -616,10 +614,12 @@ def load_audio(
         if n_channels > 1:
             y = y.reshape((-1, n_channels)).T
             if mono:
-                y = librosa.core.audio.to_mono(y)
+                y = rosa_audio.to_mono(y)
 
         if sr is not None:
-            y = librosa.core.audio.resample(y, sr_native, sr, res_type=res_type)
+            y = rosa_audio.resample(
+                y, orig_sr=sr_native, target_sr=sr, res_type=res_type
+            )
 
         else:
             sr = sr_native

@@ -1,5 +1,8 @@
-from .features.beat import RNNJointBeatProcessor
-from .features.hand_part import RNNHandPartProcessor
-from .features.key_signature import RNNKeySignatureProcessor
-from .features.quantisation import RNNJointQuantisationProcessor
-from .features.time_signature import RNNTimeSignatureProcessor
+from .midi_read import read_note_sequence
+from .processors import (
+    RNNHandPartProcessor,
+    RNNJointBeatProcessor,
+    RNNJointQuantisationProcessor,
+    RNNKeySignatureProcessor,
+    RNNTimeSignatureProcessor,
+)

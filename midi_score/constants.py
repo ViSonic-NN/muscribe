@@ -13,13 +13,8 @@ ticks_per_beat = 240
 
 # =========== time signature definitions ===========
 tsDenominators = [0, 2, 4, 8]  # 0 for others
-tsDeno2Index = {0: 0, 2: 1, 4: 2, 8: 3}
-tsIndex2Deno = {0: 0, 1: 2, 2: 4, 3: 8}
 tsDenoVocabSize = len(tsDenominators)
-
 tsNumerators = [0, 2, 3, 4, 6]  # 0 for others
-tsNume2Index = {0: 0, 2: 1, 3: 2, 4: 3, 6: 4}
-tsIndex2Nume = {0: 0, 1: 2, 2: 3, 3: 4, 4: 6}
 tsNumeVocabSize = len(tsNumerators)
 
 # =========== key signature definitions ==========

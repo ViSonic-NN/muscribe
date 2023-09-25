@@ -12,11 +12,6 @@ from .piano_vad import (
 )
 
 
-def create_folder(fd):
-    if not os.path.exists(fd):
-        os.makedirs(fd)
-
-
 def get_filename(path):
     path = os.path.realpath(path)
     na_ext = path.split("/")[-1]

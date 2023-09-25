@@ -403,10 +403,10 @@ class Regress_pedal_CRNN(nn.Module):
 
 
 # This model is not trained, but is combined from the trained note and pedal models.
-class Note_pedal(nn.Module):
+class NotePedal(nn.Module):
     def __init__(self, frames_per_second, classes_num):
         """The combination of note and pedal model."""
-        super(Note_pedal, self).__init__()
+        super(NotePedal, self).__init__()
 
         self.note_model = Regress_onset_offset_frame_velocity_CRNN(
             frames_per_second, classes_num

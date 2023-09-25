@@ -6,42 +6,31 @@ import torch
 
 from . import config, models
 from .pytorch_utils import forward
-from .utilities import RegressionPostProcessor, create_folder, write_events_to_midi
+from .utilities import RegressionPostProcessor, write_events_to_midi
 
 
 class PianoTranscription(object):
     def __init__(
         self,
-        model_type="Note_pedal",
-        checkpoint_path=None,
-        segment_samples=  * 10,
-        device=torch.device("cuda"),
+        model_type: str = "NotePedal",
+        ckpt_path: Path | None = None,
+        segment_samples: int = 16000 * 10,
+        device: str = "cuda",
     ):
-        """Class for transcribing piano solo recording.
-
-        Args:
-          model_type: str
-          checkpoint_path: str
-          segment_samples: int
-          device: 'cuda' | 'cpu'
-        """
-        if not checkpoint_path:
-            checkpoint_path = "{}/piano_transcription_inference_data/note_F1=0.9677_pedal_F1=0.9186.pth".format(
-                str(Path.home())
+        """Class for transcribing piano solo recording."""
+        if ckpt_path is None:
+            ckpt_path = (
+                Path(torch.hub.get_dir())
+                / "piano_tr"
+                / "note_F1=0.9677_pedal_F1=0.9186.pth"
             )
-        print("Checkpoint path: {}".format(checkpoint_path))
-
-        if (
-            not os.path.exists(checkpoint_path)
-            or os.path.getsize(checkpoint_path) < 1.6e8
-        ):
-            create_folder(os.path.dirname(checkpoint_path))
-            print("Total size: ~165 MB")
+        print(f"Checkpoint path: {ckpt_path}")
+        if not ckpt_path.is_file():
+            os.makedirs(ckpt_path.parent, exist_ok=True)
             zenodo_path = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
-            os.system('wget -O "{}" "{}"'.format(checkpoint_path, zenodo_path))
+            torch.hub.download_url_to_file(zenodo_path, ckpt_path, progress=True)
 
-        print("Using {} for inference.".format(device))
-
+        print(f"Using {device} for inference")
         self.segment_samples = segment_samples
         self.frames_per_second = config.frames_per_second
         self.classes_num = config.classes_num
@@ -56,7 +45,7 @@ class PianoTranscription(object):
         )
 
         # Load model
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location=device)
         self.model.load_state_dict(checkpoint["model"], strict=False)
 
         # Parallel

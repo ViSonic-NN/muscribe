@@ -14,7 +14,7 @@ class PianoTranscription(object):
         self,
         model_type="Note_pedal",
         checkpoint_path=None,
-        segment_samples=16000 * 10,
+        segment_samples=  * 10,
         device=torch.device("cuda"),
     ):
         """Class for transcribing piano solo recording.

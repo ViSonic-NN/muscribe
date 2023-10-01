@@ -2,3 +2,4 @@
 .vscode/
 __pycache__/
 _model_state_dicts/
+lightning_logs/

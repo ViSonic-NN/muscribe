@@ -1,4 +1,5 @@
-from .midi_read import read_note_sequence
+from .midi_dataset import TimeSeqMIDIDataset, read_note_sequence
+from .model import BeatPredictorPL
 from .processors import (
     RNNHandPartProcessor,
     RNNJointBeatProcessor,

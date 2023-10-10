@@ -11,17 +11,24 @@ from .midi_dataset import TimeSeqMIDIDataset, collate_fn
 
 
 class BeatPredictorPL(pl.LightningModule):
-    def __init__(self, dataset_dir: Path | str, lr: float = 0.01, batch_size: int = 4):
+    def __init__(
+        self,
+        dataset_dir: Path | str,
+        n_epochs: int,
+        lr: float = 0.1,
+        batch_size: int = 4,
+    ):
         super().__init__()
         self.dataset_dir = Path(dataset_dir)
-        self.model = BeatTransformer(128, 8, 256, 0.1, 4)
+        self.n_epochs = n_epochs
         self.lr = lr
         self.batch_size = batch_size
+        self.model = BeatTransformer(128, 8, 256, 0, 4)
         self.save_hyperparameters()
         self._dataset_kwargs = {
             "f_pickle": self.dataset_dir / "features.pkl",
-            "seq_len_sec": 10,
-            "intv_size": 0.05,
+            "seq_len_sec": 30,
+            "intv_size": 0.1,
             "annot_kinds": ["beats"],
         }
         self._loader_kwargs = {
@@ -31,23 +38,32 @@ class BeatPredictorPL(pl.LightningModule):
         }
 
     def forward(self, x: Tensor):
-        return self.model(x).transpose(1, 2)
+        return self.model(x).squeeze(-1)
 
     def configure_optimizers(self):
-        return torch.optim.SGD(self.model.parameters(), self.lr, 0.9)
+        from torch.optim import lr_scheduler as sched
+
+        optim = torch.optim.SGD(self.model.parameters(), self.lr, momentum=0.9)
+        steps_per_epoch = len(self.train_dataloader())
+        tmax = self.n_epochs * steps_per_epoch
+        scheduler = {
+            "scheduler": sched.CosineAnnealingLR(optim, T_max=tmax),
+            "interval": "step",
+        }
+        return [optim], [scheduler]
 
     def training_step(self, batch, _):
         notes, (beats,) = batch
         beats_pred = self(notes)
-        loss = f.cross_entropy(beats_pred, beats)
+        loss = self.ce_loss(beats_pred, beats)
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, _):
         notes, (beats,) = batch
         beats_pred = self(notes)
-        loss = f.cross_entropy(beats_pred, beats)
-        accuracy = torch.sum(beats_pred.argmax(dim=1) == beats) / beats.numel()
+        loss = self.ce_loss(beats_pred, beats)
+        accuracy = self.accuracy(beats_pred, beats)
         self.log("val/loss", loss)
         self.log("val/accuracy", accuracy, prog_bar=True)
         return accuracy
@@ -60,11 +76,22 @@ class BeatPredictorPL(pl.LightningModule):
 
     def val_dataloader(self):
         self.val_dataset = TimeSeqMIDIDataset(
-            self.dataset_dir, split="val", **self._dataset_kwargs
+            self.dataset_dir, split="validation", **self._dataset_kwargs
         )
-        return DataLoader(
-            self.val_dataset, shuffle=False, **self._loader_kwargs
-        )
+        return DataLoader(self.val_dataset, shuffle=False, **self._loader_kwargs)
+
+    def accuracy(self, beats_pred, beats: Tensor):
+        n_beats, total = beats.nonzero().numel(), beats.numel()
+        class0, class1 = n_beats / total, (total - n_beats) / total
+        pred_correct = beats_pred.round() == beats
+        weights = class0 + beats * (class1 - class0)
+        return (pred_correct.float() * weights).sum() / weights.sum()
+
+    def ce_loss(self, beats_pred, beats: Tensor):
+        n_beats, total = beats.nonzero().numel(), beats.numel()
+        class0, class1 = n_beats / total, (total - n_beats) / total
+        weights = class0 + beats * (class1 - class0)
+        return f.binary_cross_entropy(beats_pred, beats.float(), weights)
 
 
 class PositionalEncoding(nn.Module):
@@ -75,17 +102,17 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
         )
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe)
 
     def forward(self, x: Tensor) -> Tensor:
         """
         Arguments:
-            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+            x: Tensor, shape ``[batch_size, seq_len, embedding_dim]``
         """
-        x = x + self.pe[: x.size(0)]  # type: ignore
+        x = x + self.pe[:x.shape[1]].unsqueeze(0)  # type: ignore
         return self.dropout(x)
 
 
@@ -93,32 +120,16 @@ class BeatTransformer(nn.Module):
     def __init__(self, d_model, nhead, d_hid, dropout, nlayers):
         super(BeatTransformer, self).__init__()
         # d_model is the model's input and output dimensionality
-        self.embedding = nn.Linear(128, d_model)
-        self.positional_encoding = PositionalEncoding(d_model)
-        encoder_layers = nn.TransformerEncoderLayer(
+        self.embedding = nn.Linear(128, d_model, bias=False)
+        self.pos_encoding = PositionalEncoding(d_model, dropout)
+        enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, d_hid, dropout, batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
-
-        self.beats_head = nn.Linear(d_model, 2)
-        # self.downbeats_head = nn.Linear(d_model, 1)
-        # self.time_signatures_head = nn.Linear(d_model, 2) # one for numerator, one for denominator
-        # self.key_signatures_head = nn.Linear(d_model, num_keys)
-        # self.onsets_musical_head = nn.Linear(d_model, 1)
-        # self.note_value_head = nn.Linear(d_model, 1)
-        # self.hands_head = nn.Linear(d_model, 1)
+        self.tf_encoder = nn.TransformerEncoder(enc_layer, nlayers)
+        self.beats_head = nn.Linear(d_model, 1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.embedding(x.permute(1, 0, 2)).permute(1, 0, 2)
-        x += self.positional_encoding(x)
-        x = self.transformer_encoder(x)
-        beats = self.beats_head(x)
-        # beats = torch.softmax(self.beats_head(x), dim=-1)
-        # downbeats = torch.sigmoid(self.downbeats_head(x))
-        # time_signatures = self.time_signatures_head(x)
-        # key_signatures = self.key_signatures_head(x)
-        # onsets_musical = self.onsets_musical_head(x)
-        # note_value = self.note_value_head(x)
-        # hands = torch.sigmoid(self.hands_head(x))
-
-        return beats  # , downbeats, time_signatures, key_signatures, onsets_musical, note_value, hands
+        x = self.pos_encoding(self.embedding(x))
+        x2 = self.tf_encoder(x)
+        beats = torch.sigmoid(self.beats_head(x2))
+        return beats

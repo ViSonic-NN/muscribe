@@ -24,6 +24,7 @@ class TimeSeqMIDIDataset(MIDIDataset):
         self.device = device
         self.dataset = move_data_to_device(self.dataset, self.device)
 
+    @torch.no_grad()
     def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
         notes, annots = self.augments(self.dataset[index])
         annots: dict[str, Tensor]

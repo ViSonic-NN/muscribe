@@ -64,37 +64,38 @@ def split_and_pad(xs: Tensor, group_size: int, dim: int = 0, fill_value: float =
     return torch.stack(splitted, dim=dim)
 
 
-def time_encode_notes(notes: Tensor, iv_size: float = 0.05):
+def time_encode_notes(notes: Tensor, grid_len: float = 0.05):
     """
     Convert `notes` tensor from a MIDI file into time-encoded format.
 
     notes: A tensor of shape [n_notes, 4]
            where each row is a tuple of (pitch, onset, duration, velocity)
-    interval: Time resolution of time encoding
+    grid_len: Time resolution of time encoding
 
-    Returns: A tensor of shape [intvs, 128]
-             where intvs is the number of `interval`-sized intervals
+    Returns: A tensor of shape [grid_size, 128]
+             where grid_size is the number of `grid_len`-sized intervals
     """
 
     # Find the maximum end time to determine the length of the encoded tensor
     starts = notes[:, 1]
     ends = starts + notes[:, 2]
-    n_intervals = int(torch.ceil(ends.max() / 0.05))
+    grid_size = int(torch.ceil(ends.max() / grid_len))
     # Initialize a [intervals x 128] tensor filled with zeros
-    encoded = torch.zeros((n_intervals, 128), device=notes.device)
-    istarts = torch.floor(starts / iv_size).long()
-    iends = torch.ceil(ends / iv_size).long()
+    encoded = torch.zeros((grid_size, 128), device=notes.device)
+    istarts = torch.floor(starts / grid_len).long()
+    iends = torch.ceil(ends / grid_len).long()
     for i in range(istarts.shape[0]):
-        encoded[istarts[i] : iends[i], int(notes[i, 0].item())] = 1
+        pitch = int(notes[i, 0].item())
+        encoded[istarts[i] : iends[i], pitch] = 1
     return encoded
 
 
-def time_encode_beats(beats: Tensor, note_time_len: int, interval: float = 0.05):
-    # beats: [n_beats]
-    encoding = torch.zeros(note_time_len, device=beats.device, dtype=torch.long)
-    beats = torch.floor(beats / interval).long()
-    encoding[beats[beats < note_time_len]] = 1
-    return encoding
+def time_encode_beats(beats: Tensor, note_grid_size: int, grid_len: float = 0.05):
+    beats = beats[beats < note_grid_size * grid_len]
+    beats_idx = torch.floor(beats / grid_len).long()
+    ret = torch.zeros(note_grid_size, device=beats.device)
+    ret[beats_idx] = 1
+    return ret
 
 
 def read_note_sequence(midi_file):

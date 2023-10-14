@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
 
-from ..constants import resolution
+from .constants import RESOLUTION
 
 
 def get_in_features():
     """Return the number of input features for the proposed model"""
 
     features_pitch = 128
-    features_onset = int(4.0 / resolution) + 1  # maximum 4s for onset shift
+    features_onset = int(4.0 / RESOLUTION) + 1  # maximum 4s for onset shift
     features_duration = 1  # 1 for duration in raw value
     features_velocity = 1  # 1 for velocity in raw value and normalised to 0-1
 
@@ -48,7 +48,7 @@ def encode_note_sequence(note_seq):
     onset_shift = torch.clamp(onset_shift, 0, 4)
     # to one hot encoding
     onset_shift_onehot = F.one_hot(
-        torch.round((onset_shift / resolution)).long(), int(4 / resolution + 1)
+        torch.round((onset_shift / RESOLUTION)).long(), int(4 / RESOLUTION + 1)
     ).float()
 
     # duration

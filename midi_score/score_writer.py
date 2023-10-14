@@ -6,16 +6,26 @@ from typing import Callable, Iterator, NamedTuple, TypeVar, cast
 import numpy as np
 import pymusicxml as mxml
 
+from .pm2s.constants import NAME_TO_NSHARPS
+
 T1 = TypeVar("T1")
 T2 = TypeVar("T2")
 
 TIME_SIG_D = 4
+NOTES_IN_SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+NOTES_IN_FLATS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
 
-def pitch_to_str(pitch):
-    octave, note = int(pitch) // 12, int(pitch) % 12
-    note = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][note]
-    return f"{note}{octave}"
+def num_to_pitch(pitch_num, current_key: str | None = None):
+    # 24 is C1, and we start from 21 = A0.
+    pitch_num = int(pitch_num)
+    if pitch_num < 21:
+        raise ValueError(f"Pitch number {pitch_num} is too low")
+    pitch_num -= 12
+    octave, note = pitch_num // 12, pitch_num % 12
+    n_sharps: int = NAME_TO_NSHARPS.get(current_key, 0)  # type: ignore
+    note = (NOTES_IN_SHARPS if n_sharps >= 0 else NOTES_IN_FLATS)[note]
+    return mxml.Pitch.from_string(f"{note}{octave}")
 
 
 def splitby(xs: list[T1], is_delim: Callable[[T1], bool]) -> Iterator[list[T1]]:
@@ -40,7 +50,7 @@ def groupby(xs: list[T1], key: Callable[[T1], T2]) -> dict[T2, list[T1]]:
 class Note(NamedTuple):
     onset: Fraction
     duration: Fraction
-    pitch: str
+    pitch_num: int
     velocity: int
     is_right_hand: bool
 
@@ -63,19 +73,24 @@ def _make_events_list(
 ):
     def find_in_beats(time):
         next_beat = np.searchsorted(beats[:, 0], time)
-        assert next_beat >= 1
-        bstart, bend = beats[next_beat - 1, 0], beats[next_beat, 0]
-        blength = bend - bstart
+        assert 1 <= next_beat <= len(beats)
+        bstart = beats[next_beat - 1, 0]
+        if next_beat == len(beats):
+            # There's no next beat, but we can extrapolate the length
+            # from the previous beat...
+            assert next_beat > 1
+            blength = bstart - beats[next_beat - 2, 0]
+        else:
+            blength = beats[next_beat, 0] - bstart
         return next_beat - 1, bstart, blength
 
     def to_frac(duration: float, denoms=(1, 2, 4, 8), max_n_pieces=2):
         denoms = np.array(denoms).astype(int)
         numers = np.round(duration * denoms).astype(int)
         errors = np.abs(numers / denoms - duration)
-        n_pieces = np.array([
-            len(_into_simple_times(Fraction(n, d)))
-            for n, d in zip(numers, denoms)
-        ])
+        n_pieces = np.array(
+            [len(_into_simple_times(Fraction(n, d))) for n, d in zip(numers, denoms)]
+        )
         errors[n_pieces > max_n_pieces] = np.inf
         smallest = int(np.argmin(errors))
         return Fraction(int(numers[smallest]), int(denoms[smallest]))
@@ -86,11 +101,10 @@ def _make_events_list(
         note_beat, bstart, blength = find_in_beats(nstart)
         noffset = to_frac((nstart - bstart) / blength)
         nlength = to_frac(ndur / blength)
-        # Can be up to 1 due to fraction rounding, but never more
-        assert 0 <= noffset <= 1
-        pitch = pitch_to_str(pitch)
         is_right_hand = hand == 0
-        events.append(Note(note_beat + noffset, nlength, pitch, velo, is_right_hand))
+        events.append(
+            Note(note_beat + noffset, nlength, int(pitch), velo, is_right_hand)
+        )
     for time, key in key_changes:
         note_beat, bstart, blength = find_in_beats(time)
         # TODO: check `offset = to_frac((time - bstart) / blength)` close to 0
@@ -153,7 +167,9 @@ def _simple_timed_elems(
     return [make_dur_obj(d, t) for d, t in zip(durations, tie_status)]
 
 
-def _make_measure_notes(notes: list[Note], staff_idx: int, new_measure: NewMeasure):
+def _make_measure_notes(
+    notes: list[Note], staff_idx: int, new_measure: NewMeasure, keysig: str | None
+):
     notes_by_onset = sorted(
         groupby(notes, lambda e: e.onset).items(), key=lambda x: x[0]
     )
@@ -176,7 +192,7 @@ def _make_measure_notes(notes: list[Note], staff_idx: int, new_measure: NewMeasu
                 f"Current measure ({expected_mlen} / {TIME_SIG_D}) cannot fit more notes"
             )
         duration = cast(Fraction, min(note_dur, to_next_onset, to_measure_end))
-        pitches = [mxml.Pitch.from_string(n.pitch) for n in group]
+        pitches = [num_to_pitch(n.pitch_num, keysig) for n in group]
         ret_objs.extend(_simple_timed_elems(duration, pitches, staff_idx))
         cur_mlen = onset + duration
     # Pad to measure end by adding rests
@@ -205,9 +221,6 @@ def write_to_xml(
         new_measure = get_unique(mevents, NewMeasure)
         assert new_measure is not None
         key_change = get_unique(mevents, KeyChange)
-        notes = groupby(cast(list[Note], mevents[Note]), lambda n: n.is_right_hand)
-        rhs_content = _make_measure_notes(notes[True], 1, new_measure)
-        lhs_content = _make_measure_notes(notes[False], 2, new_measure)
         m_kwargs: dict = {}
         if not measures:
             m_kwargs["clef"] = "treble"
@@ -217,6 +230,9 @@ def write_to_xml(
         if last_time_sig != (time_sig_n := new_measure.time_sig_n):
             last_time_sig = time_sig_n
             m_kwargs["time_signature"] = time_sig_n, TIME_SIG_D
+        notes = groupby(cast(list[Note], mevents[Note]), lambda n: n.is_right_hand)
+        rhs_content = _make_measure_notes(notes[True], 1, new_measure, last_key_sig)
+        lhs_content = _make_measure_notes(notes[False], 2, new_measure, last_key_sig)
         measures.append(mxml.Measure([rhs_content, lhs_content], **m_kwargs))
     score = mxml.Score([mxml.Part("Piano", measures)])
     score.export_to_file(str(output_file))

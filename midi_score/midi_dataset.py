@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import math
 import pretty_midi
 import torch
 from torch import Tensor
@@ -41,6 +41,96 @@ class TimeSeqMIDIDataset(MIDIDataset):
                 raise NotImplementedError(f"Unsupported annotation kind: {kind}")
         annots_list = [annots[k] for k in self.annots]
         return note_chunks, annots_list
+    
+class TimeSeqMIDIDatasetWithNoteEmbedding(MIDIDataset):
+    def __init__(
+        self,
+        dataset_dir: Path,
+        f_pickle: Path,
+        split: str | list[str],
+        seq_len_sec: float,
+        intv_size: float,
+        device: str = "cpu",
+        d_model: int = 128,
+        annot_kinds: str | list[str] | None = None
+        
+    ):
+        super().__init__(dataset_dir, f_pickle, split, annot_kinds)
+        self.intv_size = intv_size
+        self.seq_n_samples = int(seq_len_sec / self.intv_size)
+        self.device = device
+        self.dataset = move_data_to_device(self.dataset, self.device)
+        self.d_model = d_model
+        
+    @torch.no_grad()
+    def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
+        notes, annots = self.augments(self.dataset[index])
+        annots: dict[str, Tensor]
+        # Shallow copy, needed when self.augments is trivial
+        # because otherwise `annots` is modified below, it goes directly to the dataset
+        # self.dropout = nn.Dropout(p=dropout)
+        max_time = torch.max(annots['beats'])
+        notes = notes[notes[:,1] <= max_time]
+        times = torch.floor(notes[:,1]/self.intv_size).unsqueeze(1)
+        durations = torch.floor(notes[:,2]/self.intv_size).unsqueeze(1)
+        max_len = notes.shape[0]
+        div_term = torch.exp(
+                torch.arange(0, self.d_model, 2) * (-math.log(10000.0) / self.d_model)
+            )
+        pe = torch.zeros(max_len, self.d_model)
+        de = torch.zeros(max_len, self.d_model)
+        pe[:, 0::2] = torch.sin(times * div_term)
+        pe[:, 1::2] = torch.cos(times * div_term)
+        de[:, 0::2] = torch.sin(durations * div_term)
+        de[:, 1::2] = torch.cos(durations * div_term)
+        annots = annots.copy()
+        note_encoded = encode_notes(notes)
+        note_encoded = note_encoded + pe[:note_encoded.shape[0]] # type: ignore
+        note_encoded = note_encoded + de[:note_encoded.shape[0]]  # type: ignore
+        note_chunks = split_and_pad(note_encoded, self.seq_n_samples, dim=0)
+        for kind in self.annots:
+            if kind in ("beats", "downbeats"):
+                beats = note_encode_beats(annots[kind], notes)
+                annots[kind] = split_and_pad(beats, self.seq_n_samples, dim=0)
+            else:
+                raise NotImplementedError(f"Unsupported annotation kind: {kind}")
+        annots_list = [annots[k] for k in self.annots]
+        return note_chunks, annots_list
+    
+
+
+        
+
+def encode_notes(notes):
+    encoded = torch.zeros(notes.shape[0], 128)
+    for i, x in enumerate(notes):
+        encoded[i,int(x[0])] = 1
+    return encoded
+
+def note_encode_beats(beats, notes):
+    encoded = torch.zeros(notes.shape[0])
+    rounded_beats = [ '%.2f' % elem for elem in beats]
+    all_beats = set(rounded_beats)
+    rounded_notes = torch.round(notes, decimals= 3)
+    for i, x in enumerate(rounded_notes):
+        if ('%.2f' % x[1] in all_beats):
+            encoded[i] = 1
+    return encoded
+
+
+
+
+
+def position_encoding_notes(notes):
+    times = torch.floor(notes[:,1].unsqueeze(1)/0.05)
+    max_len = notes.shape[0]
+    div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+    pe = torch.zeros(max_len, d_model)
+    pe[:, 0::2] = torch.sin(times * div_term)
+    pe[:, 1::2] = torch.cos(times * div_term)
+
 
 
 def collate_fn(batch):

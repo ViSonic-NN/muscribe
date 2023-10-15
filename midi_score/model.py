@@ -7,7 +7,7 @@ from torch import Tensor, nn
 from torch.nn import functional as f
 from torch.utils.data import DataLoader
 
-from .midi_dataset import TimeSeqMIDIDataset, collate_fn
+from .midi_dataset import TimeSeqMIDIDataset, collate_fn, TimeSeqMIDIDatasetWithNoteEmbedding
 
 
 class BeatPredictorPL(pl.LightningModule):
@@ -23,12 +23,13 @@ class BeatPredictorPL(pl.LightningModule):
         self.n_epochs = n_epochs
         self.lr = lr
         self.batch_size = batch_size
-        self.model = BeatTransformer(128, 8, 256, 0, 4)
+        self.model = BeatTransformer(128, 8, 256, 0, 5)
         self.save_hyperparameters()
         self._dataset_kwargs = {
+            "d_model": 128,
             "f_pickle": self.dataset_dir / "features.pkl",
-            "seq_len_sec": 30,
-            "intv_size": 0.1,
+            "seq_len_sec": 15,
+            "intv_size": 0.05,
             "annot_kinds": ["beats"],
         }
         self._loader_kwargs = {
@@ -69,13 +70,13 @@ class BeatPredictorPL(pl.LightningModule):
         return accuracy
 
     def train_dataloader(self):
-        self.train_dataset = TimeSeqMIDIDataset(
+        self.train_dataset = TimeSeqMIDIDatasetWithNoteEmbedding(
             self.dataset_dir, split="train", **self._dataset_kwargs
         )
         return DataLoader(self.train_dataset, shuffle=True, **self._loader_kwargs)
 
     def val_dataloader(self):
-        self.val_dataset = TimeSeqMIDIDataset(
+        self.val_dataset = TimeSeqMIDIDatasetWithNoteEmbedding(
             self.dataset_dir, split="validation", **self._dataset_kwargs
         )
         return DataLoader(self.val_dataset, shuffle=False, **self._loader_kwargs)
@@ -116,12 +117,13 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+
 class BeatTransformer(nn.Module):
     def __init__(self, d_model, nhead, d_hid, dropout, nlayers):
         super(BeatTransformer, self).__init__()
         # d_model is the model's input and output dimensionality
         self.embedding = nn.Linear(128, d_model, bias=False)
-        self.pos_encoding = PositionalEncoding(d_model, dropout)
+        #self.pos_encoding = PositionalEncoding(d_model, dropout)
         enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, d_hid, dropout, batch_first=True
         )
@@ -129,7 +131,8 @@ class BeatTransformer(nn.Module):
         self.beats_head = nn.Linear(d_model, 1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.pos_encoding(self.embedding(x))
+        x = self.embedding(x)#self.pos_encoding(self.embedding(x))
         x2 = self.tf_encoder(x)
         beats = torch.sigmoid(self.beats_head(x2))
         return beats
+    

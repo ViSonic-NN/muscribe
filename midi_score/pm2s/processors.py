@@ -52,6 +52,8 @@ class RNNKeySignatureProcessor(MIDIProcessor):
     def pps(self, onsets: np.ndarray, key_idx: np.ndarray):
         ks_changes = []
         for onset, kidx in zip(onsets, key_idx):
+            onset: float
+            kidx: int
             ks_cur = KEYS_BY_NAME[kidx]
             if not ks_changes or ks_changes[-1][1] != ks_cur:
                 ks_changes.append((onset, ks_cur))

@@ -7,7 +7,8 @@ from torch import Tensor, nn
 from torch.nn import functional as f
 from torch.utils.data import DataLoader
 
-from .midi_dataset import TimeSeqMIDIDataset, collate_fn
+from . import midi_dataset
+from .midi_dataset import TimeSeqMIDIDataset
 
 
 class BeatPredictorPL(pl.LightningModule):
@@ -27,15 +28,23 @@ class BeatPredictorPL(pl.LightningModule):
         self.save_hyperparameters()
         self._dataset_kwargs = {
             "f_pickle": self.dataset_dir / "features.pkl",
-            "seq_len_sec": 30,
-            "intv_size": 0.1,
-            "annot_kinds": ["beats"],
+            "seq_len_sec": 10,
+            "intv_size": 0.02,
+            "annot_kinds": ["beats", "downbeats"],
         }
         self._loader_kwargs = {
             "batch_size": batch_size,
             "num_workers": 0,
-            "collate_fn": collate_fn,
+            "collate_fn": midi_dataset.collate_fn,
         }
+
+    def run_on_midi_data(self, midi_data: Tensor) -> Tensor:
+        dkw = self._dataset_kwargs
+        seq_n_samples = int(dkw["seq_len_sec"] / dkw["intv_size"])
+        notes = midi_dataset.time_encode_notes(midi_data, dkw["intv_size"])
+        note_chunks = midi_dataset.split_and_pad(notes, seq_n_samples, dim=0)
+        activations = self.forward(note_chunks).flatten(0, 1)
+        return activations[: notes.shape[0]]  # Remove padding
 
     def forward(self, x: Tensor) -> Tensor:
         return self.model(x)
@@ -52,31 +61,19 @@ class BeatPredictorPL(pl.LightningModule):
         }
         return [optim], [scheduler]
 
-    def _step(self, notes, gt_beats, is_train: bool):
-        beat_cls = self(notes)
-        n_beats, total = gt_beats.nonzero().numel(), gt_beats.numel()
-        class0, class1 = n_beats / total, (total - n_beats) / total
-        weights = class0 + gt_beats * (class1 - class0)
-        ce_loss = f.binary_cross_entropy(beat_cls, gt_beats.float(), weights)
-        pred_correct = beat_cls.round() == gt_beats
-        weighted_acc = (pred_correct.float() * weights).sum() / weights.sum()
-        recall = torch.sum(pred_correct * gt_beats) / gt_beats.sum()
-        prefix = "train/" if is_train else "val/"
-
-        self.log(f"{prefix}accuracy", weighted_acc)
-        self.log(f"{prefix}recall", recall)
-        self.log(f"{prefix}loss", ce_loss)
-        return ce_loss, recall
+    def _step(self, batch, is_train: bool):
+        notes, (gt_beats, gt_downbeats) = batch
+        pred_beats, pred_downbeats = self(notes).permute(2, 0, 1)
+        prefix = "train" if is_train else "val"
+        bloss, brecall = self._metrics(pred_beats, gt_beats, f"{prefix}/beat/")
+        dbloss, _ = self._metrics(pred_downbeats, gt_downbeats, f"{prefix}/downbeat/")
+        return bloss + dbloss if is_train else brecall
 
     def training_step(self, batch, _):
-        notes, (gt_beats,) = batch
-        ce_loss, _ = self._step(notes, gt_beats, is_train=True)
-        return ce_loss
+        return self._step(batch, is_train=True)
 
     def validation_step(self, batch, _):
-        notes, (gt_beats,) = batch
-        _, recall = self._step(notes, gt_beats, is_train=False)
-        return recall
+        return self._step(batch, is_train=False)
 
     def train_dataloader(self):
         self.train_dataset = TimeSeqMIDIDataset(
@@ -89,6 +86,19 @@ class BeatPredictorPL(pl.LightningModule):
             self.dataset_dir, split="validation", **self._dataset_kwargs
         )
         return DataLoader(self.val_dataset, shuffle=False, **self._loader_kwargs)
+
+    def _metrics(self, pred_probs: Tensor, gt_beats: Tensor, prefix: str):
+        n_beats, total = gt_beats.nonzero().numel(), gt_beats.numel()
+        class0, class1 = n_beats / total, (total - n_beats) / total
+        weights = class0 + gt_beats * (class1 - class0)
+        ce_loss = f.binary_cross_entropy_with_logits(pred_probs, gt_beats.float(), weights)
+        pred_correct = pred_probs.round() == gt_beats
+        weighted_acc = (pred_correct.float() * weights).sum() / weights.sum()
+        recall = torch.sum(pred_correct * gt_beats) / gt_beats.sum()
+        self.log(f"{prefix}accuracy", weighted_acc)
+        self.log(f"{prefix}recall", recall)
+        self.log(f"{prefix}loss", ce_loss)
+        return ce_loss, recall
 
 
 class PositionalEncoding(nn.Module):
@@ -123,10 +133,9 @@ class BeatTransformer(nn.Module):
             d_model, nhead, d_hid, dropout, batch_first=True
         )
         self.tf_encoder = nn.TransformerEncoder(enc_layer, nlayers)
-        self.beat_cls = nn.Linear(d_model, 1)
+        self.beat_cls = nn.Linear(d_model, 2)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.pos_encoding(self.embedding(x))
         x2 = self.tf_encoder(x)
-        beat_cls = torch.sigmoid(self.beat_cls(x2))
-        return beat_cls.squeeze(-1)
+        return torch.sigmoid(self.beat_cls(x2))

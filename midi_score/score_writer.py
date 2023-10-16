@@ -10,6 +10,7 @@ from .pm2s.constants import NAME_TO_NSHARPS
 
 T1 = TypeVar("T1")
 T2 = TypeVar("T2")
+T3 = TypeVar("T3")
 
 TIME_SIG_D = 4
 NOTES_IN_SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -44,6 +45,16 @@ def groupby(xs: Iterable[T1], key: Callable[[T1], T2]) -> defaultdict[T2, list[T
     ret = defaultdict(list)
     for x in xs:
         ret[key(x)].append(x)
+    return ret
+
+
+def groupby_(
+    xs: Iterable[T1], transform: Callable[[T1], tuple[T2, T3]]
+) -> defaultdict[T2, list[T3]]:
+    ret = defaultdict(list)
+    for x in xs:
+        key, x_ = transform(x)
+        ret[key].append(x_)
     return ret
 
 
@@ -146,36 +157,30 @@ class MusicXMLBuilder:
         return np.array(prefix + bpms)
 
     def render(self, output_file: str | Path):
-        def get_unique(d: dict, ty: type[T1]) -> T1 | None:
-            if len(v := d[ty]) > 1:
-                raise ValueError(f"Multiple {ty} in one onset: {v}")
-            return v[0] if len(v) == 1 else None
-
         measures = []
         last_key_sig: str | None = None
         last_time_sig: int | None = None
         for mevents in splitby(self.sorted_events, lambda e: isinstance(e, NewMeasure)):
-            mevents = groupby(mevents, type)
-            new_measure = get_unique(mevents, NewMeasure)
-            assert new_measure is not None
-            key_change = get_unique(mevents, KeyChange)
+            assert isinstance(nm := mevents[0], NewMeasure)
+            mevents = groupby(mevents[1:], type)
+            key_changes = mevents[KeyChange]
             m_kwargs: dict = {}
             if not measures:
                 m_kwargs["clef"] = "treble"
-            if key_change and last_key_sig != (key := key_change.key):
+            if key_changes and last_key_sig != (key := key_changes[0].key):
+                if len(key_changes) > 1:
+                    print(f"Multiple key changes in one measure: {key_changes}")
                 last_key_sig = key
                 m_kwargs["key"] = key
-            if last_time_sig != (time_sig_n := new_measure.time_sig_n):
+            if last_time_sig != (time_sig_n := nm.time_sig_n):
                 last_time_sig = time_sig_n
                 m_kwargs["time_signature"] = time_sig_n, TIME_SIG_D
             notes = groupby(cast(list[Note], mevents[Note]), lambda n: n.is_right_hand)
             # Add any BPM change to the right hand
             rhs_content = _make_measure_notes(
-                notes[True], 1, new_measure, last_key_sig, mevents[BPMChange]
+                notes[True], 1, nm, last_key_sig, mevents[BPMChange]
             )
-            lhs_content = _make_measure_notes(
-                notes[False], 2, new_measure, last_key_sig
-            )
+            lhs_content = _make_measure_notes(notes[False], 2, nm, last_key_sig)
             measures.append(mxml.Measure([rhs_content, lhs_content], **m_kwargs))
         score = mxml.Score([mxml.Part("Piano", measures)])
         score.export_to_file(str(output_file))
@@ -217,23 +222,31 @@ class MusicXMLBuilder:
         return Fraction(int(numers[smallest]), int(denoms[smallest]))
 
 
-def _into_simple_times(duration: Fraction) -> list[Fraction]:
+def _into_simple_times(duration: Fraction, max_dots: int = 2) -> list[Fraction]:
     def is_pow_of_2(n: int):
         return n & (n - 1) == 0
 
-    def nearest_pow_of_2(n: int):
-        return 2 ** int(np.log2(n))
+    # If we refer to no dots as 1 beat, as you add dots, you get 3/2, 7/4, 15/8, etc.
+    # approaching 2. So we'll just scale the duration into [1, 2]
+    # and find a fraction from `dots` that's close to it.
+    dots = np.array([Fraction(1, 2**i) for i in range(0, max_dots + 1)]).cumsum()
+
+    def nearest_simple_numer(duration: Fraction):
+        power = int(np.floor(np.log2(float(duration))))
+        scaled = duration / 2**power
+        assert 1 <= scaled < 2
+        closest: Fraction = dots[np.argmin(np.abs(float(scaled) - dots.astype(float)))]
+        return closest * 2**power if power >= 0 else closest / 2**-power
 
     if duration <= 0:
         return []
-    duration = duration * 4 / TIME_SIG_D
     assert isinstance(duration, Fraction) and is_pow_of_2(duration.denominator)
-    durations = []
-    while duration > 0:
-        next_dur = Fraction(nearest_pow_of_2(duration.numerator), duration.denominator)
-        durations.append(next_dur)
-        duration -= next_dur
-    return durations
+    w_duration = duration * 4 / TIME_SIG_D  # Written duration
+    sub_durs = []
+    while w_duration > 0:
+        sub_durs.append(next_dur := nearest_simple_numer(w_duration))
+        w_duration -= next_dur
+    return sub_durs
 
 
 def _simple_timed_elems(
@@ -275,18 +288,23 @@ def _make_measure_notes(
     staff_idx: int,
     new_measure: NewMeasure,
     keysig: str | None,
-    directions: Sequence[BPMChange] = tuple(),
+    bpm_changes: Sequence[BPMChange] = tuple(),
 ):
     notes_by_onset = sorted(
         groupby(notes, lambda e: e.onset).items(), key=lambda x: x[0]
     )
 
-    # Stick directions to their closest notes
-    def closest_note_group_idx(onset):
+    # Stick bpm_changes to their closest notes
+    def closest_note_idx(bpm_change: BPMChange):
+        # Round to int -- don't give silly numbers like 123.23123176 BPM
+        direction = mxml.MetronomeMark(1, int(bpm_change.bpm))
+        if not notes_by_onset:
+            return None, direction
         onsets = np.array([onset for onset, _ in notes_by_onset])
-        return int(np.argmin(np.abs(onsets - onset)))
+        key = int(np.argmin(np.abs(onsets - bpm_change.onset)))
+        return key, direction
 
-    directions_ = groupby(directions, lambda d: closest_note_group_idx(d.onset))
+    directions_ = groupby_(bpm_changes, closest_note_idx)
     expected_mlen = new_measure.time_sig_n
     ret_objs: list[mxml.Note | mxml.Rest | mxml.Chord] = []
     cur_mlen = Fraction(0, 1)
@@ -307,10 +325,14 @@ def _make_measure_notes(
             )
         duration = cast(Fraction, min(note_dur, to_next_onset, to_measure_end))
         pitches = [num_to_pitch(n.pitch_num, keysig) for n in group]
-        # Round to int -- don't give silly numbers like 123.23123176 BPM
-        bpm_changes = [mxml.MetronomeMark(1, int(b.bpm)) for b in directions_[i]]
-        ret_objs.extend(_simple_timed_elems(duration, staff_idx, pitches, bpm_changes))
+        ret_objs.extend(
+            _simple_timed_elems(duration, staff_idx, pitches, directions_[i])
+        )
         cur_mlen = onset + duration
     # Pad to measure end by adding rests
-    ret_objs.extend(_simple_timed_elems(expected_mlen - cur_mlen, staff_idx, []))
+    # NOTE: if there's no note in this measure at all, the following still works
+    # but now we need to add directions to the first rest.
+    ret_objs.extend(
+        _simple_timed_elems(expected_mlen - cur_mlen, staff_idx, [], directions_[None])
+    )
     return ret_objs

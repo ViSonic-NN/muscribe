@@ -113,7 +113,7 @@ class TimeEncoder:
         self.ngroups, self.nstarts, rem_starts = self._group_onsets(notes[:, 1])
         self.nends = torch.ceil((rem_starts + notes[:, 2]) / grid_len).long()
         self.nends.clamp_max_(split_size)
-        self.npitches = notes[:, 0].long()
+        self.npitches, self.nvelos = notes[:, 0].long(), notes[:, 3].long()
         # itable: [split_size, 1]
         itable = torch.arange(split_size, dtype=torch.long, device=notes.device)
         self.itable = itable.unsqueeze(-1)
@@ -127,6 +127,7 @@ class TimeEncoder:
         encoder = cls(notes, zeros, zeros, grid_len, split_size)
         ngroups = len(encoder)
         actual_len = int(encoder.nends[encoder.ngroups == ngroups - 1].max())
+        actual_len += (ngroups - 1) * split_size
         return torch.stack([encoder[i][0] for i in range(ngroups)]), actual_len
 
     def __len__(self):
@@ -138,14 +139,13 @@ class TimeEncoder:
         device = self.nstarts.device
         mask = self.ngroups == grp_idx
         istarts_, iends_ = self.nstarts[mask], self.nends[mask]
-        # note_mask: [grid_size, group_n_notes] is a time-wise True-False mask for each note
-        note_mask = (istarts_[None, :] <= self.itable) & (self.itable < iends_[None, :])
+        # mask2d: [grid_size, group_n_notes] is a time-wise True-False mask for each note
+        mask2d = (istarts_[None, :] <= self.itable) & (self.itable < iends_[None, :])
+        mask2d_pitches = mask2d.float() * self.npitches[None, mask]
         # `index_add_` does self[:, index[i]] += src[:, i] when dim == 1
-        # (effectively reducing masks along pitch-dimension) on a [grid_size, 128] tensor.
+        # (effectively sending pitches along velo-dimension) on a [grid_size, 128] tensor.
         notes_enc = torch.zeros(self.split_size, 128, device=device)
-        notes_enc.index_add_(1, self.npitches[mask], note_mask.float())
-        # Don't multi-count notes.
-        notes_enc[notes_enc > 1] = 1
+        notes_enc.index_add_(1, self.nvelos[mask], mask2d_pitches)
 
         beats_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
         beats_enc[self.bstarts[self.bgroups == grp_idx]] = 1

@@ -18,6 +18,9 @@ class BeatPredictorPL(pl.LightningModule):
         n_epochs: int,
         lr: float = 0.2,
         batch_size: int = 4,
+        seq_len_sec: int = 10,
+        grid_len: float = 0.02,
+        **dataset_kwargs,
     ):
         super().__init__()
         self.dataset_dir = Path(dataset_dir)
@@ -28,9 +31,10 @@ class BeatPredictorPL(pl.LightningModule):
         self.save_hyperparameters()
         self._dataset_kwargs = {
             "f_pickle": self.dataset_dir / "features.pkl",
-            "seq_len_sec": 10,
-            "intv_size": 0.02,
-            "annot_kinds": ["beats", "downbeats"],
+            "annot_kinds": ["beats"],
+            "seq_len_sec": seq_len_sec,
+            "grid_len": grid_len,
+            **dataset_kwargs
         }
         self._loader_kwargs = {
             "batch_size": batch_size,
@@ -38,13 +42,15 @@ class BeatPredictorPL(pl.LightningModule):
             "collate_fn": midi_dataset.collate_fn,
         }
 
+    @torch.no_grad()
     def run_on_midi_data(self, midi_data: Tensor) -> Tensor:
         dkw = self._dataset_kwargs
         seq_n_samples = int(dkw["seq_len_sec"] / dkw["intv_size"])
         notes = midi_dataset.time_encode_notes(midi_data, dkw["intv_size"])
         note_chunks = midi_dataset.split_and_pad(notes, seq_n_samples, dim=0)
         activations = self.forward(note_chunks).flatten(0, 1)
-        return activations[: notes.shape[0]]  # Remove padding
+        activations = activations[: notes.shape[0]]  # Remove padding
+        return activations.detach().cpu()
 
     def forward(self, x: Tensor) -> Tensor:
         return self.model(x)
@@ -62,12 +68,11 @@ class BeatPredictorPL(pl.LightningModule):
         return [optim], [scheduler]
 
     def _step(self, batch, is_train: bool):
-        notes, (gt_beats, gt_downbeats) = batch
-        pred_beats, pred_downbeats = self(notes).permute(2, 0, 1)
-        prefix = "train" if is_train else "val"
-        bloss, brecall = self._metrics(pred_beats, gt_beats, f"{prefix}/beat/")
-        dbloss, _ = self._metrics(pred_downbeats, gt_downbeats, f"{prefix}/downbeat/")
-        return bloss + dbloss if is_train else brecall
+        notes, (gt_beats,) = batch
+        pred_probs = self(notes)
+        prefix = "train/" if is_train else "val/"
+        loss, recall = self._metrics(pred_probs, gt_beats, prefix)
+        return loss if is_train else recall
 
     def training_step(self, batch, _):
         return self._step(batch, is_train=True)
@@ -88,16 +93,18 @@ class BeatPredictorPL(pl.LightningModule):
         return DataLoader(self.val_dataset, shuffle=False, **self._loader_kwargs)
 
     def _metrics(self, pred_probs: Tensor, gt_beats: Tensor, prefix: str):
-        n_beats, total = gt_beats.nonzero().numel(), gt_beats.numel()
-        class0, class1 = n_beats / total, (total - n_beats) / total
-        weights = class0 + gt_beats * (class1 - class0)
-        ce_loss = f.binary_cross_entropy_with_logits(pred_probs, gt_beats.float(), weights)
-        pred_correct = pred_probs.round() == gt_beats
-        weighted_acc = (pred_correct.float() * weights).sum() / weights.sum()
-        recall = torch.sum(pred_correct * gt_beats) / gt_beats.sum()
+        cls_weights = gt_beats.numel() / gt_beats.flatten().bincount() / 3  # 3 classes
+        ce_loss = f.cross_entropy(pred_probs.transpose(1, 2), gt_beats, cls_weights)
+        gt_beat_ws = cls_weights[gt_beats]
+        pred_correct = (pred_probs.argmax(dim=-1) == gt_beats).float()
+        weighted_acc = (pred_correct * gt_beat_ws).sum() / gt_beat_ws.sum()
+        # Set non-beat predictions to have 0 weight, and the exact same formula
+        # computes recall.
+        gt_beat_ws[gt_beats == 0] = 0
+        recall = (pred_correct * gt_beat_ws).sum() / gt_beat_ws.sum()
+        self.log(f"{prefix}loss", ce_loss)
         self.log(f"{prefix}accuracy", weighted_acc)
         self.log(f"{prefix}recall", recall)
-        self.log(f"{prefix}loss", ce_loss)
         return ce_loss, recall
 
 
@@ -133,9 +140,9 @@ class BeatTransformer(nn.Module):
             d_model, nhead, d_hid, dropout, batch_first=True
         )
         self.tf_encoder = nn.TransformerEncoder(enc_layer, nlayers)
-        self.beat_cls = nn.Linear(d_model, 2)
+        self.beat_cls = nn.Linear(d_model, 3)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.pos_encoding(self.embedding(x))
         x2 = self.tf_encoder(x)
-        return torch.sigmoid(self.beat_cls(x2))
+        return self.beat_cls(x2)

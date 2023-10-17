@@ -1,3 +1,4 @@
+import logging
 import math
 from pathlib import Path
 
@@ -10,15 +11,17 @@ from torch.utils.data import DataLoader
 from . import midi_dataset
 from .midi_dataset import TimeSeqMIDIDataset
 
+logger = logging.getLogger(__name__)
+
 
 class BeatPredictorPL(pl.LightningModule):
     def __init__(
         self,
         dataset_dir: Path | str,
         n_epochs: int,
-        lr: float = 0.2,
-        batch_size: int = 4,
-        seq_len_sec: int = 10,
+        lr: float = 0.02,
+        batch_size: int = 32,
+        seq_len_sec: int = 15,
         grid_len: float = 0.02,
         **dataset_kwargs,
     ):
@@ -29,28 +32,24 @@ class BeatPredictorPL(pl.LightningModule):
         self.batch_size = batch_size
         self.model = BeatTransformer(128, 8, 256, 0.1, 4)
         self.save_hyperparameters()
+        self.grid_len = grid_len
+        self.seq_n_samples = int(seq_len_sec / self.grid_len)
         self._dataset_kwargs = {
             "f_pickle": self.dataset_dir / "features.pkl",
-            "annot_kinds": ["beats"],
             "seq_len_sec": seq_len_sec,
             "grid_len": grid_len,
-            **dataset_kwargs
+            **dataset_kwargs,
         }
-        self._loader_kwargs = {
-            "batch_size": batch_size,
-            "num_workers": 0,
-            "collate_fn": midi_dataset.collate_fn,
-        }
+        self._loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 0}
 
     @torch.no_grad()
     def run_on_midi_data(self, midi_data: Tensor) -> Tensor:
-        dkw = self._dataset_kwargs
-        seq_n_samples = int(dkw["seq_len_sec"] / dkw["intv_size"])
-        notes = midi_dataset.time_encode_notes(midi_data, dkw["intv_size"])
-        note_chunks = midi_dataset.split_and_pad(notes, seq_n_samples, dim=0)
-        activations = self.forward(note_chunks).flatten(0, 1)
-        activations = activations[: notes.shape[0]]  # Remove padding
-        return activations.detach().cpu()
+        note_grid, max_len = midi_dataset.TimeEncoder.get_whole_encoding(
+            midi_data, self.grid_len, self.seq_n_samples
+        )
+        activs = torch.softmax(self.forward(note_grid).flatten(0, 1), dim=-1)
+        # Remove padding and non-beat-class probs
+        return activs[:max_len, 1:].detach().cpu()
 
     def forward(self, x: Tensor) -> Tensor:
         return self.model(x)
@@ -68,7 +67,7 @@ class BeatPredictorPL(pl.LightningModule):
         return [optim], [scheduler]
 
     def _step(self, batch, is_train: bool):
-        notes, (gt_beats,) = batch
+        notes, gt_beats = batch
         pred_probs = self(notes)
         prefix = "train/" if is_train else "val/"
         loss, recall = self._metrics(pred_probs, gt_beats, prefix)
@@ -81,15 +80,19 @@ class BeatPredictorPL(pl.LightningModule):
         return self._step(batch, is_train=False)
 
     def train_dataloader(self):
+        device = self.device
         self.train_dataset = TimeSeqMIDIDataset(
-            self.dataset_dir, split="train", **self._dataset_kwargs
+            self.dataset_dir, split="train", **self._dataset_kwargs, device=device
         )
+        logger.info("Train dataset size: %d", len(self.train_dataset))
         return DataLoader(self.train_dataset, shuffle=True, **self._loader_kwargs)
 
     def val_dataloader(self):
+        device = self.device
         self.val_dataset = TimeSeqMIDIDataset(
-            self.dataset_dir, split="validation", **self._dataset_kwargs
+            self.dataset_dir, split="validation", **self._dataset_kwargs, device=device
         )
+        logger.info("Val dataset size: %d", len(self.val_dataset))
         return DataLoader(self.val_dataset, shuffle=False, **self._loader_kwargs)
 
     def _metrics(self, pred_probs: Tensor, gt_beats: Tensor, prefix: str):

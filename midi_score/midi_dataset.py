@@ -60,98 +60,103 @@ class TimeSeqMIDIDataset(MIDIDataset):
         split: str | list[str],
         seq_len_sec: float,
         grid_len: float,
-        device: str = "cpu",
-        annot_kinds: str | list[str] | None = None,
+        device: str | torch.device = "cpu",
     ):
-        if annot_kinds is None:
-            annot_kinds = datautils.ANNOT_KEYS.copy()
-            annot_kinds.remove("downbeats")
-        elif "downbeats" in annot_kinds:
-            raise ValueError("Downbeats are provided with beats in TimeSeqMIDIDataset")
-        super().__init__(dataset_dir, f_pickle, split, annot_kinds)
-        self.grid_len = grid_len
-        self.seq_n_samples = int(seq_len_sec / self.grid_len)
-        self.device = device
-        self.dataset = move_data_to_device(self.dataset, self.device)
+        super().__init__(dataset_dir, f_pickle, split, ["beats"])
+        self.dataset = move_data_to_device(self.dataset, device)
+        seq_n_samples = int(seq_len_sec / grid_len)
+        self.subprocessors = [
+            TimeEncoder(
+                notes, annots["beats"], annots["downbeats"], grid_len, seq_n_samples
+            )
+            for notes, annots in self.dataset
+        ]
+        piece_sizes = [len(x) for x in self.subprocessors]
+        self.idx2idx = torch.cumsum(torch.tensor(piece_sizes), dim=0)
+
+    def __len__(self):
+        return int(self.idx2idx[-1])
 
     @torch.no_grad()
-    def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
-        notes, annots = self.augments(self.dataset[index])
-        annots: dict[str, Tensor]
-        # Shallow copy, needed when self.augments is trivial
-        # because otherwise `annots` is modified below, it goes directly to the dataset
-        annots = annots.copy()
-        notes = time_encode_notes(notes)
-        note_chunks = split_and_pad(notes, self.seq_n_samples, dim=0)
-        ret_annots = []
-        for kind in self.annots:
-            if kind != "beats":
-                raise NotImplementedError(f"Unsupported annotation kind: {kind}")
-            beats, downbeats = annots["beats"], annots["downbeats"]
-            beats = time_encode_beats(beats, downbeats, notes.shape[0])
-            beats = split_and_pad(beats, self.seq_n_samples, dim=0)
-            ret_annots.append(beats)
-        return note_chunks, ret_annots
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        data_idx = torch.searchsorted(self.idx2idx, index, right=True)
+        assert 0 <= data_idx < len(self.dataset)
+        rem = index - (int(self.idx2idx[data_idx - 1]) if data_idx > 0 else 0)
+        subp = self.subprocessors[data_idx]
+        return subp[rem]
 
 
-def collate_fn(batch):
-    # use concat instead of stack
-    notes, annots = zip(*batch)
-    notes = torch.cat(notes, dim=0)
-    annots = [torch.cat(a, dim=0) for a in zip(*annots)]
-    return notes, annots
-
-
-def split_and_pad(xs: Tensor, group_size: int, dim: int = 0, fill_value: float = 0.0):
-    splitted = list(torch.split(xs, group_size, dim=dim))
-    assert len(splitted) >= 1
-    last = splitted[-1]
-    if (last_len := last.shape[dim]) < group_size:
-        shape = list(last.shape)
-        shape[dim] = group_size - last_len
-        filler = torch.full(shape, fill_value, dtype=last.dtype, device=last.device)
-        splitted[-1] = torch.concat([last, filler], dim=dim)
-        assert splitted[-1].shape[dim] == group_size
-    return torch.stack(splitted, dim=dim)
-
-
-def time_encode_notes(notes: Tensor, grid_len: float = 0.05):
+class TimeEncoder:
     """
-    Convert `notes` tensor from a MIDI file into time-encoded format.
+    Convert `notes` tensor from a MIDI file into time-encoded format,
+    and does so lazily -- only when a particular time interval is requested.
 
     notes: A tensor of shape [n_notes, 4]
            where each row is a tuple of (pitch, onset, duration, velocity)
     grid_len: Time resolution of time encoding
-
-    Returns: A tensor of shape [grid_size, 128]
-             where grid_size is the number of `grid_len`-sized intervals
+    split_size: Number of time steps in each group
     """
 
-    # Find the maximum end time to determine the length of the encoded tensor
-    starts = notes[:, 1]
-    ends = starts + notes[:, 2]
-    grid_size = int(torch.ceil(ends.max() / grid_len))
-    # Initialize a [intervals x 128] tensor filled with zeros
-    encoded = torch.zeros((grid_size, 128), device=notes.device)
-    istarts = torch.floor(starts / grid_len).long()
-    iends = torch.ceil(ends / grid_len).long()
-    for i in range(istarts.shape[0]):
-        pitch = int(notes[i, 0].item())
-        encoded[istarts[i] : iends[i], pitch] = 1
-    return encoded
+    def __init__(
+        self,
+        notes: Tensor,
+        beats: Tensor,
+        downbeats: Tensor,
+        grid_len: float,
+        split_size: int,
+    ) -> None:
+        self.grid_len = grid_len
+        self.split_size = split_size
+        # Decide which grids each note spans.
+        # NOTE: if a note extends beyond its group, we just drop the excessive part
+        # (and also NOT add it to the next group).
+        self.ngroups, self.nstarts, rem_starts = self._group_onsets(notes[:, 1])
+        self.nends = torch.ceil((rem_starts + notes[:, 2]) / grid_len).long()
+        self.nends.clamp_max_(split_size)
+        self.npitches = notes[:, 0].long()
+        # itable: [split_size, 1]
+        itable = torch.arange(split_size, dtype=torch.long, device=notes.device)
+        self.itable = itable.unsqueeze(-1)
+        # Process beats and downbeats
+        self.bgroups, self.bstarts, _ = self._group_onsets(beats)
+        self.dgroups, self.dstarts, _ = self._group_onsets(downbeats)
 
+    @classmethod
+    def get_whole_encoding(cls, notes: Tensor, grid_len: float, split_size: int):
+        zeros = torch.zeros(0, device=notes.device)
+        encoder = cls(notes, zeros, zeros, grid_len, split_size)
+        ngroups = len(encoder)
+        actual_len = int(encoder.nends[encoder.ngroups == ngroups - 1].max())
+        return torch.stack([encoder[i][0] for i in range(ngroups)]), actual_len
 
-def time_encode_beats(
-    beats: Tensor, downbeats: Tensor, note_grid_size: int, grid_len: float = 0.05
-):
-    beats_idx = torch.floor(beats / grid_len).long()
-    beats_idx = beats_idx[beats_idx < note_grid_size]
-    dbeats_idx = torch.floor(downbeats / grid_len).long()
-    dbeats_idx = dbeats_idx[dbeats_idx < note_grid_size]
-    ret = torch.zeros(note_grid_size, device=beats.device, dtype=torch.long)
-    ret[beats_idx] = 1
-    ret[dbeats_idx] = 2
-    return ret
+    def __len__(self):
+        return int(self.ngroups.max() + 1)
+
+    def __getitem__(self, grp_idx: int):
+        # Create the encoded output, by first creating a mask for each split group
+        # and use the mask to index into the output tensor.
+        device = self.nstarts.device
+        mask = self.ngroups == grp_idx
+        istarts_, iends_ = self.nstarts[mask], self.nends[mask]
+        # note_mask: [grid_size, group_n_notes] is a time-wise True-False mask for each note
+        note_mask = (istarts_[None, :] <= self.itable) & (self.itable < iends_[None, :])
+        # `index_add_` does self[:, index[i]] += src[:, i] when dim == 1
+        # (effectively reducing masks along pitch-dimension) on a [grid_size, 128] tensor.
+        notes_enc = torch.zeros(self.split_size, 128, device=device)
+        notes_enc.index_add_(1, self.npitches[mask], note_mask.float())
+        # Don't multi-count notes.
+        notes_enc[notes_enc > 1] = 1
+
+        beats_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
+        beats_enc[self.bstarts[self.bgroups == grp_idx]] = 1
+        beats_enc[self.dstarts[self.dgroups == grp_idx]] = 2
+        return notes_enc, beats_enc
+
+    def _group_onsets(self, onsets: Tensor):
+        group_t = self.split_size * self.grid_len
+        groups, onsets = onsets // group_t, onsets % group_t
+        start_idxs = torch.floor(onsets / self.grid_len).long()
+        return groups, start_idxs, onsets
 
 
 class RandomTempoChange(nn.Module):

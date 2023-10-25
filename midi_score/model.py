@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from . import midi_dataset
 from .midi_dataset import TimeSeqMIDIDataset
+import madmom.features
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,9 @@ class BeatPredictorPL(pl.LightningModule):
     def __init__(
         self,
         dataset_dir: Path | str,
-        lr: float = 1e-3,
-        batch_size: int = 64,
-        seq_len_sec: int = 30,
+        lr: float = 1e-4,
+        batch_size: int = 20,
+        seq_len_sec: int = 40,
         grid_len: float = 0.02,
         **dataset_kwargs,
     ):
@@ -28,7 +29,7 @@ class BeatPredictorPL(pl.LightningModule):
         self.dataset_dir = Path(dataset_dir)
         self.lr = lr
         self.batch_size = batch_size
-        self.model = BeatCRNN(32, 256, 2, 0.1)
+        self.model = BeatCRNN(512, 256, 3, 0.1)
         self.save_hyperparameters()
         self.grid_len = grid_len
         self.seq_n_samples = int(seq_len_sec / self.grid_len)
@@ -65,12 +66,12 @@ class BeatPredictorPL(pl.LightningModule):
         return [optim], [scheduler]
 
     def training_step(self, batch, _):
-        notes, gt_beats = batch
+        notes, gt_beats, _, _ = batch
         pred_probs = self(notes)
         return self._metrics(pred_probs, gt_beats, True)
 
     def validation_step(self, batch, _):
-        notes, gt_beats = batch
+        notes, gt_beats, _, _ = batch
         pred_probs = self(notes)
         return self._metrics(pred_probs, gt_beats, False)
 
@@ -91,8 +92,36 @@ class BeatPredictorPL(pl.LightningModule):
         return DataLoader(val_dataset, shuffle=False, **self._loader_kwargs)
 
     def _metrics(self, pred_probs: Tensor, gt_beats: Tensor, is_train: bool):
-        cls_weights = torch.tensor([1, 10, 20]).float().cuda()
-        ce_loss = f.cross_entropy(pred_probs.transpose(1, 2), gt_beats, cls_weights)
+        # cls_weights = torch.tensor([1, 10, 20]).float().cuda()
+        # Convert gt_beats into two binary labels
+        binary_label_1 = (gt_beats == 1).float()
+        binary_label_2 = (gt_beats == 2).float()
+        # No need to compute binary_label_2 as it's redundant (1 - binary_label_0 - binary_label_1)
+        # Predicted labels based on logits
+        predicted_1 = torch.sigmoid(pred_probs[:,:,1]) > 0.5
+        predicted_2 = torch.sigmoid(pred_probs[:,:,2]) > 0.5
+
+        # Identify TP, TN, FP, FN for the two binary labels
+        TP_1 = (binary_label_1 * predicted_1.float()).float()
+        TN_1 = ((1 - binary_label_1) * (1 - predicted_1.float())).float()
+
+        TP_2 = (binary_label_2 * predicted_2.float()).float()
+        TN_2 = ((1 - binary_label_2) * (1 - predicted_2.float())).float()
+
+        # Assign weights
+        weight_TP = 20.0
+        weight_TN = 1.0
+
+        weights_1 = TP_1 * (weight_TP - 1) + TN_1 * (weight_TN - 1) + 1
+        weights_2 = TP_2 * (weight_TP - 1) + TN_2 * (weight_TN - 1) + 1
+
+        # Compute binary cross-entropy for each binary label
+        bce_loss_1 = f.binary_cross_entropy_with_logits(pred_probs[:,:,1], binary_label_1, weight = weights_1)
+        bce_loss_2 = f.binary_cross_entropy_with_logits(pred_probs[:,:,2], binary_label_2, weight = weights_2)
+
+        # Sum the two binary cross-entropies
+        ce_loss = bce_loss_1 + bce_loss_2
+
 
         predicted = pred_probs.argmax(dim=-1)
         gt_beats_, pred_beats_ = gt_beats != 0, predicted != 0
@@ -104,13 +133,25 @@ class BeatPredictorPL(pl.LightningModule):
 
         prefix = "train/" if is_train else "val/"
         sync_dist = not is_train
-        self.log(f"{prefix}loss", ce_loss, sync_dist=sync_dist, prog_bar=is_train)
-        self.log(f"{prefix}b_prec", b_prec, sync_dist=sync_dist)
-        self.log(f"{prefix}b_recall", b_recall, sync_dist=sync_dist)
-        self.log(f"{prefix}b_f1", b_f1, sync_dist=sync_dist)
-        self.log(f"{prefix}db_recall", db_recall, sync_dist=sync_dist)
+        self.log(f"{prefix}loss", ce_loss, sync_dist = sync_dist, prog_bar=is_train)
+        self.log(f"{prefix}b_prec", b_prec, sync_dist = sync_dist)
+        self.log(f"{prefix}b_recall", b_recall, sync_dist = sync_dist)
+        self.log(f"{prefix}b_f1", b_f1, sync_dist = sync_dist)
+        self.log(f"{prefix}db_recall", db_recall, sync_dist = sync_dist)
         return ce_loss if is_train else b_recall
 
+    # def __batch_apply_filter(self, input_tensor):
+    #     filter = madmom.features.DBNBeatTrackingProcessor(fps = 1/self.grid_len)
+    #     return_tensor = torch.zeros(input_tensor.shape)
+    #     for i in range(input_tensor.shape[0]):
+    #         return_tensor[i, torch.floor(filter(input_tensor[i,:])/self.grid_len)] = 1
+    #     return return_tensor
+            
+
+    @property
+    def example_input_array(self):
+        return torch.rand(1, self.seq_n_samples, 128)
+    
     @property
     def example_input_array(self):
         return torch.rand(1, self.seq_n_samples, 128)
@@ -176,6 +217,7 @@ class BeatCRNN(nn.Module):
     def __init__(self, d_model: int, d_hid: int, n_rnn_layers: int, dropout: float):
         super().__init__()
         self.embedding = nn.Linear(128, d_model)
+        self.lazy_norm = nn.LazyBatchNorm1d()
         self.convs = nn.Sequential(
             *self._make_block(d_model, d_hid // 4, 9, dropout),
             *self._make_block(d_hid // 4, d_hid // 2, 9, dropout),
@@ -190,10 +232,12 @@ class BeatCRNN(nn.Module):
             bidirectional=True,
         )
         self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
-
+        # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
+        # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
     def forward(self, x: Tensor):
         # x: [batch_size, seq_len, 128]
         x = self.embedding(x)
+        x = self.lazy_norm(x)
         # x: [batch_size, seq_len, d_model]
         x = self.convs(x.transpose(1, 2)).transpose(1, 2)
         # x: [batch_size, seq_len, d_hid]

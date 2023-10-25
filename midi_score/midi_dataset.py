@@ -61,13 +61,14 @@ class TimeSeqMIDIDataset(MIDIDataset):
         seq_len_sec: float,
         grid_len: float,
         device: str | torch.device = "cpu",
+        features: list[str] = ["beats","downbeats"]
     ):
-        super().__init__(dataset_dir, f_pickle, split, ["beats"])
+        super().__init__(dataset_dir, f_pickle, split, features)
         self.dataset = move_data_to_device(self.dataset, device)
         seq_n_samples = int(seq_len_sec / grid_len)
         self.subprocessors = [
             TimeEncoder(
-                notes, annots["beats"], annots["downbeats"], grid_len, seq_n_samples
+                notes, annots, grid_len, seq_n_samples, features
             )
             for notes, annots in self.dataset
         ]
@@ -87,6 +88,7 @@ class TimeSeqMIDIDataset(MIDIDataset):
 
 
 class TimeEncoder:
+    
     """
     Convert `notes` tensor from a MIDI file into time-encoded format,
     and does so lazily -- only when a particular time interval is requested.
@@ -96,17 +98,22 @@ class TimeEncoder:
     grid_len: Time resolution of time encoding
     split_size: Number of time steps in each group
     """
-
     def __init__(
         self,
         notes: Tensor,
-        beats: Tensor,
-        downbeats: Tensor,
+        annots: dict[str, Tensor],
         grid_len: float,
         split_size: int,
+        features: list[str]
     ) -> None:
         self.grid_len = grid_len
         self.split_size = split_size
+        
+        #Initialize annotations based on features
+        for feature in annots:
+            if feature in features:
+                setattr(self, feature, annots[feature])
+
         # Decide which grids each note spans.
         # NOTE: if a note extends beyond its group, we just drop the excessive part
         # (and also NOT add it to the next group).
@@ -117,14 +124,21 @@ class TimeEncoder:
         # itable: [split_size, 1]
         itable = torch.arange(split_size, dtype=torch.long, device=notes.device)
         self.itable = itable.unsqueeze(-1)
+
         # Process beats and downbeats
-        self.bgroups, self.bstarts, _ = self._group_onsets(beats)
-        self.dgroups, self.dstarts, _ = self._group_onsets(downbeats)
+        if hasattr(self, 'beats'):
+            self.bgroups, self.bstarts, _ = self._group_onsets(self.beats)
+        if hasattr(self, 'downbeats'):
+            self.dgroups, self.dstarts, _ = self._group_onsets(self.downbeats)
+        if hasattr(self, 'time_signatures'):
+            self.tgroups, self.tstarts, _ = self._group_onsets(self.time_signatures[:,0])
+        if hasattr(self, 'key_signatures'):
+            self.kgroups, self.kstarts, _ = self._group_onsets(self.key_signatures[:,0])                
 
     @classmethod
     def get_whole_encoding(cls, notes: Tensor, grid_len: float, split_size: int):
-        zeros = torch.zeros(0, device=notes.device)
-        encoder = cls(notes, zeros, zeros, grid_len, split_size)
+        zeros = {'beats': torch.zeros(0, device=notes.device), 'downbeats': torch.zeros(0, device=notes.device)}
+        encoder = cls(notes, zeros, grid_len, split_size, cls.features)
         ngroups = len(encoder)
         actual_len = int(encoder.nends[encoder.ngroups == ngroups - 1].max())
         actual_len += (ngroups - 1) * split_size
@@ -148,9 +162,26 @@ class TimeEncoder:
         notes_enc.index_add_(1, self.nvelos[mask], mask2d_pitches)
 
         beats_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
-        beats_enc[self.bstarts[self.bgroups == grp_idx]] = 1
-        beats_enc[self.dstarts[self.dgroups == grp_idx]] = 2
-        return notes_enc, beats_enc
+        ts_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
+        key_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
+        if hasattr(self, 'beats'):
+            beats_enc[self.bstarts[self.bgroups == grp_idx]] = 1
+        if hasattr(self, 'downbeats'):
+            beats_enc[self.dstarts[self.dgroups == grp_idx]] = 2
+        if hasattr(self, 'time_signatures'):
+            group_t = self.split_size * self.grid_len
+            for onset, ts in self.time_signatures[self.time_signatures[:,0] > group_t*grp_idx and self.time_signatures[:,0] < group_t*(grp_idx + 1),:]:
+                onset = onset % group_t
+                start_idxs = onset // self.grid_len
+                ts_enc[start_idxs:] = ts
+        if hasattr(self, 'key_signatures'):
+            group_t = self.split_size * self.grid_len
+            for onset, ks in self.key_signatures[self.key_signatures[:,0] > group_t*grp_idx and self.key_signatures[:,0] < group_t*(grp_idx + 1),:]:
+                onset = onset % group_t
+                start_idxs = onset // self.grid_len
+                key_enc[start_idxs:] = ks
+
+        return notes_enc, beats_enc, ts_enc, key_enc
 
     def _group_onsets(self, onsets: Tensor):
         group_t = self.split_size * self.grid_len

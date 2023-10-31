@@ -1,0 +1,16 @@
+audioread==3.0.1
+BeatNet==1.1.1
+BeatNet==1.1.1
+librosa==0.10.1
+madmom==0.17.dev0
+matplotlib==3.8.0
+mido==1.2.10
+mir_eval==0.7
+numpy==1.26.1
+pandas==2.1.2
+pretty_midi==0.2.10
+pymusicxml==0.5.6
+pytorch_lightning==2.0.9
+torch==2.0.0.post301
+torchlibrosa==0.1.0
+tqdm==4.66.1

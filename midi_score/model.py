@@ -11,6 +11,9 @@ from torch.utils.data import DataLoader
 from . import midi_dataset
 from .midi_dataset import TimeSeqMIDIDataset
 import madmom.features
+from pytorch_lightning.utilities import grad_norm
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +23,8 @@ class BeatPredictorPL(pl.LightningModule):
         self,
         dataset_dir: Path | str,
         lr: float = 1e-4,
-        batch_size: int = 20,
-        seq_len_sec: int = 40,
+        batch_size: int = 7,
+        seq_len_sec: int = 150,
         grid_len: float = 0.02,
         **dataset_kwargs,
     ):
@@ -29,7 +32,7 @@ class BeatPredictorPL(pl.LightningModule):
         self.dataset_dir = Path(dataset_dir)
         self.lr = lr
         self.batch_size = batch_size
-        self.model = BeatCRNN(512, 256, 3, 0.1)
+        self.model = BeatCRNN(256, 128, 4, 0.1)
         self.save_hyperparameters()
         self.grid_len = grid_len
         self.seq_n_samples = int(seq_len_sec / self.grid_len)
@@ -56,7 +59,8 @@ class BeatPredictorPL(pl.LightningModule):
     def configure_optimizers(self):
         from torch.optim import lr_scheduler as sched
 
-        optim = torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=0.01)
+        optim = torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=0.00001)
+        #optim = torch.optim.SGD(self.model.parameters(), self.lr, momentum=0.9)
         scheduler = {
             "scheduler": sched.CosineAnnealingLR(optim, T_max=self.num_training_steps),
             "interval": "step",
@@ -67,8 +71,20 @@ class BeatPredictorPL(pl.LightningModule):
 
     def training_step(self, batch, _):
         notes, gt_beats, _, _ = batch
+        assert torch.isnan(notes).any() == False, "Assert Failed: NaN in input"
         pred_probs = self(notes)
         return self._metrics(pred_probs, gt_beats, True)
+
+    def on_before_optimizer_step(self, optimizer):
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
+        # example to inspect gradient information in tensorboard
+        if self.trainer.global_step % 25 == 0:  # don't make the tf file huge
+            for k, v in self.named_parameters():
+                self.logger.experiment.add_histogram(
+                    tag=k, values=v.grad, global_step=self.trainer.global_step
+                )
+
 
     def validation_step(self, batch, _):
         notes, gt_beats, _, _ = batch
@@ -96,6 +112,10 @@ class BeatPredictorPL(pl.LightningModule):
         # Convert gt_beats into two binary labels
         binary_label_1 = (gt_beats == 1).float()
         binary_label_2 = (gt_beats == 2).float()
+
+        # check for nan
+        assert torch.count_nonzero(gt_beats != gt_beats) == 0
+
         # No need to compute binary_label_2 as it's redundant (1 - binary_label_0 - binary_label_1)
         # Predicted labels based on logits
         predicted_1 = torch.sigmoid(pred_probs[:,:,1]) > 0.5
@@ -120,8 +140,15 @@ class BeatPredictorPL(pl.LightningModule):
         bce_loss_2 = f.binary_cross_entropy_with_logits(pred_probs[:,:,2], binary_label_2, weight = weights_2)
 
         # Sum the two binary cross-entropies
-        ce_loss = bce_loss_1 + bce_loss_2
+        ce_loss = bce_loss_1 + bce_loss_2 +   2*(torch.count_nonzero(binary_label_1) + torch.count_nonzero(binary_label_2))/(gt_beats.shape[1]*gt_beats.shape[0])
 
+        # Checking for nan again, sigh
+
+        if (ce_loss != ce_loss):
+            print(gt_beats)
+            print(pred_probs)
+
+        assert ce_loss == ce_loss
 
         predicted = pred_probs.argmax(dim=-1)
         gt_beats_, pred_beats_ = gt_beats != 0, predicted != 0
@@ -140,13 +167,7 @@ class BeatPredictorPL(pl.LightningModule):
         self.log(f"{prefix}db_recall", db_recall, sync_dist = sync_dist)
         return ce_loss if is_train else b_recall
 
-    # def __batch_apply_filter(self, input_tensor):
-    #     filter = madmom.features.DBNBeatTrackingProcessor(fps = 1/self.grid_len)
-    #     return_tensor = torch.zeros(input_tensor.shape)
-    #     for i in range(input_tensor.shape[0]):
-    #         return_tensor[i, torch.floor(filter(input_tensor[i,:])/self.grid_len)] = 1
-    #     return return_tensor
-            
+
 
     @property
     def example_input_array(self):
@@ -212,6 +233,16 @@ class BeatTransformer(nn.Module):
         x2 = self.tf_encoder(x)
         return self.beat_cls(x2)
 
+class AddGaussianNoise(object):
+    def __init__(self, mean=0., std=1.):
+        self.std = std
+        self.mean = mean
+        
+    def __call__(self, tensor):
+        return tensor + torch.randn(tensor.size()) * self.std + self.mean
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 class BeatCRNN(nn.Module):
     def __init__(self, d_model: int, d_hid: int, n_rnn_layers: int, dropout: float):
@@ -235,13 +266,23 @@ class BeatCRNN(nn.Module):
         # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
         # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
     def forward(self, x: Tensor):
+        assert torch.isnan(x).any() == False, "Assert Failed: NaN before embedding"
+        assert torch.count_nonzero(x) > 0, "Assert Failed: input Tensor is all zero"
         # x: [batch_size, seq_len, 128]
-        x = self.embedding(x)
-        x = self.lazy_norm(x)
+        x1 = self.embedding(x)
+        if(torch.isnan(x1).any()):
+            print(x)
+            #print(x1)
+        assert torch.isnan(x1).any() == False, "Assert Failed: NaN after embedding"
+
+        x2 = self.lazy_norm(x1)
         # x: [batch_size, seq_len, d_model]
-        x = self.convs(x.transpose(1, 2)).transpose(1, 2)
+        assert torch.isnan(x2).any() == False, "Assert Failed: NaN after lazy norm"
+        x3 = self.convs(x2.transpose(1, 2)).transpose(1, 2)
         # x: [batch_size, seq_len, d_hid]
-        gru_beat, _ = self.gru(x)
+        assert torch.isnan(x3).any() == False, "Assert Failed: NaN after conv"
+        gru_beat, _ = self.gru(x3)
+        assert torch.isnan(gru_beat).any() == False, "Assert Failed: NaN after gru"
         # gru_beat: [batch_size, seq_len, d_hid]
         return self.beat_cls(gru_beat)
         # return: [batch_size, seq_len, 3]
@@ -257,7 +298,7 @@ class BeatCRNN(nn.Module):
                 padding=kernel_size // 2,
             ),
             nn.BatchNorm1d(in_feats),
-            nn.ReLU6(),
+            nn.LeakyReLU (),
             nn.Conv1d(
                 in_channels=in_feats,
                 out_channels=out_feats,
@@ -265,6 +306,6 @@ class BeatCRNN(nn.Module):
                 padding=0,
             ),
             nn.BatchNorm1d(out_feats),
-            nn.ReLU6(),
+            nn.LeakyReLU (),
             nn.Dropout(p=dropout),
         ]

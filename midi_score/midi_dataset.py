@@ -152,6 +152,7 @@ class TimeEncoder:
         # and use the mask to index into the output tensor.
         device = self.nstarts.device
         mask = self.ngroups == grp_idx
+        addNoise = AddGaussianNoise(0.001, .0001)
         istarts_, iends_ = self.nstarts[mask], self.nends[mask]
         # mask2d: [grid_size, group_n_notes] is a time-wise True-False mask for each note
         mask2d = (istarts_[None, :] <= self.itable) & (self.itable < iends_[None, :])
@@ -159,8 +160,12 @@ class TimeEncoder:
         # `index_add_` does self[:, index[i]] += src[:, i] when dim == 1
         # (effectively sending pitches along velo-dimension) on a [grid_size, 128] tensor.
         notes_enc = torch.zeros(self.split_size, 128, device=device)
+        notes_enc = addNoise(notes_enc)
         notes_enc.index_add_(1, self.nvelos[mask], mask2d_pitches)
 
+        # check for nan
+        assert torch.isnan(notes_enc).any() == False, "Assert failed: nan in input encoding"
+        
         beats_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
         ts_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
         key_enc = torch.zeros(self.split_size, device=device, dtype=torch.long)
@@ -189,6 +194,16 @@ class TimeEncoder:
         start_idxs = torch.floor(onsets / self.grid_len).long()
         return groups, start_idxs, onsets
 
+class AddGaussianNoise(object):
+    def __init__(self, mean=0., std=1.):
+        self.std = std
+        self.mean = mean
+        
+    def __call__(self, tensor):
+        return tensor + torch.randn(tensor.size(), device= tensor.device) * self.std + self.mean
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 class RandomTempoChange(nn.Module):
     def __init__(

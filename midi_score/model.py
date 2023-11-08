@@ -23,8 +23,8 @@ class BeatPredictorPL(pl.LightningModule):
         self,
         dataset_dir: Path | str,
         lr: float = 1e-4,
-        batch_size: int = 7,
-        seq_len_sec: int = 150,
+        batch_size: int = 5,
+        seq_len_sec: int = 100,
         grid_len: float = 0.02,
         **dataset_kwargs,
     ):
@@ -32,7 +32,7 @@ class BeatPredictorPL(pl.LightningModule):
         self.dataset_dir = Path(dataset_dir)
         self.lr = lr
         self.batch_size = batch_size
-        self.model = BeatCRNN(256, 128, 4, 0.1)
+        self.model = BeatCRNN(1024, 512, 7, 0.1)
         self.save_hyperparameters()
         self.grid_len = grid_len
         self.seq_n_samples = int(seq_len_sec / self.grid_len)
@@ -42,7 +42,7 @@ class BeatPredictorPL(pl.LightningModule):
             "grid_len": grid_len,
             **dataset_kwargs,
         }
-        self._loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 0}
+        self._loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 12}
 
     @torch.no_grad()
     def run_on_midi_data(self, midi_data: Tensor) -> Tensor:
@@ -54,12 +54,13 @@ class BeatPredictorPL(pl.LightningModule):
         return activs[:max_len].detach().cpu()
 
     def forward(self, x: Tensor) -> Tensor:
+        x = x.to(self.device, non_blocking=True)
         return self.model(x)
 
     def configure_optimizers(self):
         from torch.optim import lr_scheduler as sched
 
-        optim = torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=0.00001)
+        optim = torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=0.0001)
         #optim = torch.optim.SGD(self.model.parameters(), self.lr, momentum=0.9)
         scheduler = {
             "scheduler": sched.CosineAnnealingLR(optim, T_max=self.num_training_steps),
@@ -92,7 +93,7 @@ class BeatPredictorPL(pl.LightningModule):
         return self._metrics(pred_probs, gt_beats, False)
 
     def train_dataloader(self):
-        device = self.device
+        device = "cpu"
         train_dataset = TimeSeqMIDIDataset(
             self.dataset_dir, split="train", **self._dataset_kwargs, device=device
         )
@@ -100,7 +101,7 @@ class BeatPredictorPL(pl.LightningModule):
         return DataLoader(train_dataset, shuffle=True, **self._loader_kwargs)
 
     def val_dataloader(self):
-        device = self.device
+        device = "cpu"
         val_dataset = TimeSeqMIDIDataset(
             self.dataset_dir, split="validation", **self._dataset_kwargs, device=device
         )
@@ -140,7 +141,7 @@ class BeatPredictorPL(pl.LightningModule):
         bce_loss_2 = f.binary_cross_entropy_with_logits(pred_probs[:,:,2], binary_label_2, weight = weights_2)
 
         # Sum the two binary cross-entropies
-        ce_loss = bce_loss_1 + bce_loss_2 +   2*(torch.count_nonzero(binary_label_1) + torch.count_nonzero(binary_label_2))/(gt_beats.shape[1]*gt_beats.shape[0])
+        ce_loss = bce_loss_1 + bce_loss_2 +  (torch.count_nonzero(binary_label_1) + torch.count_nonzero(binary_label_2))/(gt_beats.shape[1]*gt_beats.shape[0])
 
         # Checking for nan again, sigh
 

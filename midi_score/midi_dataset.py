@@ -152,7 +152,7 @@ class TimeEncoder:
         # and use the mask to index into the output tensor.
         device = self.nstarts.device
         mask = self.ngroups == grp_idx
-        addNoise = AddGaussianNoise(0.001, .0001)
+        addNoise = AddGaussianNoise(0.0000001, .0000000001)
         istarts_, iends_ = self.nstarts[mask], self.nends[mask]
         # mask2d: [grid_size, group_n_notes] is a time-wise True-False mask for each note
         mask2d = (istarts_[None, :] <= self.itable) & (self.itable < iends_[None, :])

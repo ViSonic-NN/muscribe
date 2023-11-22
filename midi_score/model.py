@@ -23,8 +23,8 @@ class BeatPredictorPL(pl.LightningModule):
         self,
         dataset_dir: Path | str,
         lr: float = 1e-4,
-        batch_size: int = 5,
-        seq_len_sec: int = 100,
+        batch_size: int = 3,
+        seq_len_sec: int = 50,
         grid_len: float = 0.02,
         **dataset_kwargs,
     ):
@@ -32,7 +32,7 @@ class BeatPredictorPL(pl.LightningModule):
         self.dataset_dir = Path(dataset_dir)
         self.lr = lr
         self.batch_size = batch_size
-        self.model = BeatCRNN(1024, 512, 7, 0.1)
+        self.model = BeatCRNN(512, 256, 4, 0.1)
         self.save_hyperparameters()
         self.grid_len = grid_len
         self.seq_n_samples = int(seq_len_sec / self.grid_len)
@@ -42,7 +42,7 @@ class BeatPredictorPL(pl.LightningModule):
             "grid_len": grid_len,
             **dataset_kwargs,
         }
-        self._loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 12}
+        self._loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 16}
 
     @torch.no_grad()
     def run_on_midi_data(self, midi_data: Tensor) -> Tensor:
@@ -54,13 +54,12 @@ class BeatPredictorPL(pl.LightningModule):
         return activs[:max_len].detach().cpu()
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x.to(self.device, non_blocking=True)
         return self.model(x)
 
     def configure_optimizers(self):
         from torch.optim import lr_scheduler as sched
 
-        optim = torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=0.0001)
+        optim = torch.optim.Adam(self.model.parameters(), self.lr, weight_decay=0)
         #optim = torch.optim.SGD(self.model.parameters(), self.lr, momentum=0.9)
         scheduler = {
             "scheduler": sched.CosineAnnealingLR(optim, T_max=self.num_training_steps),
@@ -71,9 +70,9 @@ class BeatPredictorPL(pl.LightningModule):
         return [optim], [scheduler]
 
     def training_step(self, batch, _):
-        notes, gt_beats, _, _ = batch
+        notes, gt_beats, _, _  = batch
         assert torch.isnan(notes).any() == False, "Assert Failed: NaN in input"
-        pred_probs = self(notes)
+        pred_probs = self(notes.to(self.device))
         return self._metrics(pred_probs, gt_beats, True)
 
     def on_before_optimizer_step(self, optimizer):
@@ -88,23 +87,29 @@ class BeatPredictorPL(pl.LightningModule):
 
 
     def validation_step(self, batch, _):
-        notes, gt_beats, _, _ = batch
+        notes, gt_beats, _, _   = batch
         pred_probs = self(notes)
         return self._metrics(pred_probs, gt_beats, False)
 
     def train_dataloader(self):
         device = "cpu"
+
+        # device = self.device
         train_dataset = TimeSeqMIDIDataset(
-            self.dataset_dir, split="train", **self._dataset_kwargs, device=device
+            self.dataset_dir, split = "train", **self._dataset_kwargs, device=device
         )
+
         logger.info("Train dataset size: %d", len(train_dataset))
         return DataLoader(train_dataset, shuffle=True, **self._loader_kwargs)
 
     def val_dataloader(self):
         device = "cpu"
+        
+        # device = self.device
         val_dataset = TimeSeqMIDIDataset(
-            self.dataset_dir, split="validation", **self._dataset_kwargs, device=device
+            self.dataset_dir, split = "validation", **self._dataset_kwargs, device=device
         )
+        
         logger.info("Val dataset size: %d", len(val_dataset))
         return DataLoader(val_dataset, shuffle=False, **self._loader_kwargs)
 
@@ -141,7 +146,7 @@ class BeatPredictorPL(pl.LightningModule):
         bce_loss_2 = f.binary_cross_entropy_with_logits(pred_probs[:,:,2], binary_label_2, weight = weights_2)
 
         # Sum the two binary cross-entropies
-        ce_loss = bce_loss_1 + bce_loss_2 +  (torch.count_nonzero(binary_label_1) + torch.count_nonzero(binary_label_2))/(gt_beats.shape[1]*gt_beats.shape[0])
+        ce_loss = bce_loss_1 + bce_loss_2 
 
         # Checking for nan again, sigh
 
@@ -248,41 +253,33 @@ class AddGaussianNoise(object):
 class BeatCRNN(nn.Module):
     def __init__(self, d_model: int, d_hid: int, n_rnn_layers: int, dropout: float):
         super().__init__()
-        self.embedding = nn.Linear(128, d_model)
-        self.lazy_norm = nn.LazyBatchNorm1d()
-        self.convs = nn.Sequential(
-            *self._make_block(d_model, d_hid // 4, 9, dropout),
-            *self._make_block(d_hid // 4, d_hid // 2, 9, dropout),
-            *self._make_block(d_hid // 2, d_hid, 9, dropout),
+        self.conv2ds = nn.Sequential(
+            *self._make_2d_block(1, d_hid, (15, 128), 'same', dropout)
         )
+
+        self.embedding = nn.Linear(128, d_model)
         self.gru = nn.LSTM(
-            input_size=d_hid,
-            hidden_size=d_hid // 2,
+            input_size=d_model,
+            hidden_size=d_model // 2,
             num_layers=n_rnn_layers,
             batch_first=True,
             dropout=dropout,
             bidirectional=True,
         )
-        self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
-        # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
-        # self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_hid, 3))
+        self.beat_cls = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(d_model, 3))
+
+
     def forward(self, x: Tensor):
         assert torch.isnan(x).any() == False, "Assert Failed: NaN before embedding"
         assert torch.count_nonzero(x) > 0, "Assert Failed: input Tensor is all zero"
-        # x: [batch_size, seq_len, 128]
-        x1 = self.embedding(x)
-        if(torch.isnan(x1).any()):
-            print(x)
-            #print(x1)
-        assert torch.isnan(x1).any() == False, "Assert Failed: NaN after embedding"
+        x = self.conv2ds(x.unsqueeze(1))
+        x = x.squeeze(1)
+        x = nn.ReLU()(self.embedding(x))
+        assert torch.isnan(x).any() == False, "Assert Failed: NaN after embedding"
 
-        x2 = self.lazy_norm(x1)
-        # x: [batch_size, seq_len, d_model]
-        assert torch.isnan(x2).any() == False, "Assert Failed: NaN after lazy norm"
-        x3 = self.convs(x2.transpose(1, 2)).transpose(1, 2)
-        # x: [batch_size, seq_len, d_hid]
-        assert torch.isnan(x3).any() == False, "Assert Failed: NaN after conv"
-        gru_beat, _ = self.gru(x3)
+        # # x: [batch_size, seq_len, d_model]
+        # # x: [batch_size, seq_len, d_hid]
+        gru_beat, _ = self.gru(x)
         assert torch.isnan(gru_beat).any() == False, "Assert Failed: NaN after gru"
         # gru_beat: [batch_size, seq_len, d_hid]
         return self.beat_cls(gru_beat)
@@ -299,7 +296,7 @@ class BeatCRNN(nn.Module):
                 padding=kernel_size // 2,
             ),
             nn.BatchNorm1d(in_feats),
-            nn.LeakyReLU (),
+            nn.LeakyReLU(),
             nn.Conv1d(
                 in_channels=in_feats,
                 out_channels=out_feats,
@@ -307,6 +304,29 @@ class BeatCRNN(nn.Module):
                 padding=0,
             ),
             nn.BatchNorm1d(out_feats),
-            nn.LeakyReLU (),
+            nn.LeakyReLU(),
             nn.Dropout(p=dropout),
         ]
+    
+    @staticmethod
+    def _make_2d_block(in_feats: int, out_feats: int, kernel_size: int | tuple, padding: str | int, dropout: float):
+        return [
+            nn.Conv2d(
+                in_channels=in_feats,
+                out_channels=out_feats,
+                kernel_size=kernel_size,
+                padding=padding,
+            ),
+            nn.LazyBatchNorm2d(),
+            nn.LeakyReLU(),
+            nn.Conv2d(
+                in_channels=out_feats,
+                out_channels=1,
+                kernel_size=kernel_size,
+                padding=padding,
+            ),
+            nn.LazyBatchNorm2d(),
+            nn.LeakyReLU(),
+            nn.Dropout(p=dropout),
+        ]
+

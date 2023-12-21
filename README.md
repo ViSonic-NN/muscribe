@@ -1,6 +1,6 @@
 # Muscribe (Formerly Muscript)
 
-**Note** Project is still under heavy development, a number of features might not work as intended.
+**Note** Project is still under heavy development, a number of features might not work as intended. 
 
 This is a project meant to provide an end-to-end transcription from audio music files to sheet music. The project is largely divided into two parts:
 
@@ -15,6 +15,8 @@ This is a project meant to provide an end-to-end transcription from audio music 
     - This part of the project is largely based around [PM2S](https://cheriell.github.io/research/PM2S/) (ISMIR 2022).
     - However, accuracy is lacking in beat tracking & note quantization, we're exploring newer models to enhance this part of the prediction.
     - PM2S also offers prediction models for hand tracking (piano) and time / key signature changes, which are still valuable. (Need to evaluate thoroughly.)
+
+Please see *issues* for the latest progress.
 
 ## Environments
 

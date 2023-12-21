@@ -21,13 +21,15 @@ class MuscribeModelWrapper:
         self,
         beat_model: any = BeatNet(model=1),
         time_model: any = None,
-        key_model: any = None,
-        device: str =  "cuda" if torch.cuda.is_available() else "cpu"
+        key_model: any = midi_score.RNNKeySignatureProcessor(),
+        device: str =  "cuda" if torch.cuda.is_available() else "cpu",
+        use_custom_model = False
     ) -> None:
         self.beat_model = beat_model
         self.time_model = time_model
         self.key_model = key_model
         self.device = device
+        self.use_custom_model = use_custom_model
 
     def get_midi(self, audio_path, output_midi_path):
         (audio, _) = load_audio(audio_path, sr=sample_rate, mono=True)
@@ -40,17 +42,14 @@ class MuscribeModelWrapper:
         
     def get_beats(self, use_midi = False, path = None, midi_notes = None):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        if(use_midi == False):
-            beat_activ = self.beat_model.activation_extractor_online(path)
+        if(self.use_custom_model == False):
+            beatnet = BeatNet(model=1)
+            beat_activ = beatnet.activation_extractor_online(path)
         else:
             pred = self.beat_model(midi_notes).squeeze(0)
-            
-            print(b[b != 0])
             beat_activ =  torch.zeros(pred.shape[0], 2, device = device)
-            print(beat_activ.shape)
-            beat_activ[b,0] = 1
-            beat_activ[db,1] = 1
-            print(beat_activ.shape)
+            beat_activ[pred[0:] > 0/5 ,0] = 1
+            beat_activ[pred[1:] > 0/5 ,1] = 1
         db_tracker = DBNDownBeatTrackingProcessor(beats_per_bar=[2, 3, 4], fps=50)
         return db_tracker(beat_activ)  # Using DBN offline inference to infer beat/downbeats
 

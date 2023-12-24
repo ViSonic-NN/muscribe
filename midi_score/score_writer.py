@@ -1,3 +1,4 @@
+import logging
 from collections import defaultdict
 from fractions import Fraction
 from pathlib import Path
@@ -15,6 +16,8 @@ T3 = TypeVar("T3")
 TIME_SIG_D = 4
 NOTES_IN_SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 NOTES_IN_FLATS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+
+logger = logging.getLogger(__name__)
 
 
 def num_to_pitch(pitch_num, current_key: str | None = None):
@@ -198,14 +201,20 @@ class MusicXMLBuilder:
 
     def _find_in_beats(self, time):
         next_beat = np.searchsorted(self.beats[:, 0], time)
-        assert 1 <= next_beat <= len(self.beats)
-        bstart = self.beats[next_beat - 1, 0]
+        if next_beat == 0:
+            # The note comes before the first beat, so there is no "previous" beat time,
+            # which we'll extrapolate from the first two beats.
+            # We'll also pretend that the beat starts right on `time`.
+            bstart = time
+            blength = self.beats[1, 0] - self.beats[0, 0]
+            return 0, time, blength
         if next_beat == len(self.beats):
-            # There's no next beat, but we can extrapolate the length
-            # from the previous beat...
-            assert next_beat > 1
-            blength = bstart - self.beats[next_beat - 2, 0]
+            # The note comes after the last beat, and we'll extrapolate from the last two beats.
+            bstart = self.beats[-2, 0]
+            blength = self.beats[-1, 0] - bstart
         else:
+            assert 1 <= next_beat < len(self.beats)
+            bstart = self.beats[next_beat - 1, 0]
             blength = self.beats[next_beat, 0] - bstart
         return next_beat - 1, bstart, blength
 
@@ -320,8 +329,10 @@ def _make_measure_notes(
         if i < len(notes_by_onset) - 1:
             to_next_onset = notes_by_onset[i + 1][0] - new_measure.onset - onset
         if (to_measure_end := expected_mlen - onset) <= 0:
-            raise ValueError(
-                f"Current measure ({expected_mlen} / {TIME_SIG_D}) cannot fit more notes"
+            logger.warn(
+                "Current measure (time sig %d / %d) cannot fit more notes",
+                expected_mlen,
+                TIME_SIG_D,
             )
         duration = cast(Fraction, min(note_dur, to_next_onset, to_measure_end))
         pitches = [num_to_pitch(n.pitch_num, keysig) for n in group]

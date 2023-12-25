@@ -1,3 +1,3 @@
-[submodule "midi_score/dataset"]
+[submodule "muscribe/midi2score/dataset"]
 	path = muscribe/midi2score/dataset
 	url = ../muscribe-data.git

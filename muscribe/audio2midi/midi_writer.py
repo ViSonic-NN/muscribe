@@ -1,87 +1,11 @@
-import os
-
-import audioread
-import librosa.core.audio as rosa_audio
 import numpy as np
-from mido import MidiFile
+from mido import Message, MetaMessage, MidiFile, MidiTrack
 
-from . import config
+from .. import params
 from .piano_vad import (
     note_detection_with_onset_offset_regress,
     pedal_detection_with_onset_offset_regress,
 )
-
-
-def get_filename(path):
-    path = os.path.realpath(path)
-    na_ext = path.split("/")[-1]
-    na = os.path.splitext(na_ext)[0]
-    return na
-
-
-def note_to_freq(piano_note):
-    return 2 ** ((piano_note - 39) / 12) * 440
-
-
-def float32_to_int16(x):
-    assert np.max(np.abs(x)) <= 1.0
-    return (x * 32767.0).astype(np.int16)
-
-
-def int16_to_float32(x):
-    return (x / 32767.0).astype(np.float32)
-
-
-def pad_truncate_sequence(x, max_len):
-    if len(x) < max_len:
-        return np.concatenate((x, np.zeros(max_len - len(x))))
-    else:
-        return x[0:max_len]
-
-
-def read_midi(midi_path):
-    """Parse MIDI file.
-
-    Args:
-      midi_path: str
-
-    Returns:
-      midi_dict: dict, e.g. {
-        'midi_event': [
-            'program_change channel=0 program=0 time=0',
-            'control_change channel=0 control=64 value=127 time=0',
-            'control_change channel=0 control=64 value=63 time=236',
-            ...],
-        'midi_event_time': [0., 0, 0.98307292, ...]}
-    """
-
-    midi_file = MidiFile(midi_path)
-    ticks_per_beat = midi_file.ticks_per_beat
-
-    assert len(midi_file.tracks) == 2
-    """The first track contains tempo, time signature. The second track 
-    contains piano events."""
-
-    microseconds_per_beat = midi_file.tracks[0][0].tempo
-    beats_per_second = 1e6 / microseconds_per_beat
-    ticks_per_second = ticks_per_beat * beats_per_second
-
-    message_list = []
-
-    ticks = 0
-    time_in_second = []
-
-    for message in midi_file.tracks[1]:
-        message_list.append(str(message))
-        ticks += message.time
-        time_in_second.append(ticks / ticks_per_second)
-
-    midi_dict = {
-        "midi_event": np.array(message_list),
-        "midi_event_time": np.array(time_in_second),
-    }
-
-    return midi_dict
 
 
 def write_events_to_midi(start_time, note_events, pedal_events, midi_path):
@@ -95,8 +19,6 @@ def write_events_to_midi(start_time, note_events, pedal_events, midi_path):
         ...]
       midi_path: str
     """
-    from mido import Message, MetaMessage, MidiFile, MidiTrack
-
     # This configuration is the same as MIDIs in MAESTRO dataset
     ticks_per_beat = 384
     beats_per_second = 2
@@ -208,8 +130,8 @@ class RegressionPostProcessor(object):
         self.offset_threshold = offset_threshold
         self.frame_threshold = frame_threshold
         self.pedal_offset_threshold = pedal_offset_threshold
-        self.begin_note = config.begin_note
-        self.velocity_scale = config.velocity_scale
+        self.begin_note = params.begin_note
+        self.velocity_scale = params.velocity_scale
 
     def output_dict_to_midi_events(self, output_dict):
         """Main function. Post process model outputs to MIDI events.
@@ -549,77 +471,3 @@ class RegressionPostProcessor(object):
             )
 
         return pedal_events
-
-
-def load_audio(
-    path,
-    sr=22050,
-    mono=True,
-    offset=0.0,
-    duration=None,
-    dtype=np.float32,
-    res_type="kaiser_best",
-    backends=[audioread.ffdec.FFmpegAudioFile],
-):
-    """Load audio. Copied from librosa.core.load() except that ffmpeg backend is
-    always used in this function."""
-
-    y = []
-    with audioread.audio_open(os.path.realpath(path), backends=backends) as input_file:
-        sr_native = input_file.samplerate
-        n_channels = input_file.channels
-
-        s_start = int(np.round(sr_native * offset)) * n_channels
-
-        if duration is None:
-            s_end = np.inf
-        else:
-            s_end = s_start + (int(np.round(sr_native * duration)) * n_channels)
-
-        n = 0
-
-        for frame in input_file:
-            frame = rosa_audio.util.buf_to_float(frame, dtype=dtype)
-            n_prev = n
-            n = n + len(frame)
-
-            if n < s_start:
-                # offset is after the current frame
-                # keep reading
-                continue
-
-            if s_end < n_prev:
-                # we're off the end.  stop reading
-                break
-
-            if s_end < n:
-                # the end is in this frame.  crop.
-                frame = frame[: s_end - n_prev]
-
-            if n_prev <= s_start <= n:
-                # beginning is in this frame
-                frame = frame[(s_start - n_prev) :]
-
-            # tack on the current frame
-            y.append(frame)
-
-    if y:
-        y = np.concatenate(y)
-
-        if n_channels > 1:
-            y = y.reshape((-1, n_channels)).T
-            if mono:
-                y = rosa_audio.to_mono(y)
-
-        if sr is not None:
-            y = rosa_audio.resample(
-                y, orig_sr=sr_native, target_sr=sr, res_type=res_type
-            )
-
-        else:
-            sr = sr_native
-
-    # Final cleanup for dtype and contiguity
-    y = np.ascontiguousarray(y, dtype=dtype)
-
-    return (y, sr)

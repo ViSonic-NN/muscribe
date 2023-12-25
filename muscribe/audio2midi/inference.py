@@ -1,12 +1,17 @@
-import os
+import logging
+from collections import defaultdict
 from pathlib import Path
 
+import librosa
 import numpy as np
 import torch
+from tqdm import trange
 
-from . import config, models
-from .pytorch_utils import forward
-from .utilities import RegressionPostProcessor, write_events_to_midi
+from .. import params
+from . import models
+from .midi_writer import RegressionPostProcessor, write_events_to_midi
+
+logger = logging.getLogger(__name__)
 
 
 class PianoTranscription(object):
@@ -14,8 +19,8 @@ class PianoTranscription(object):
         self,
         model_type: str = "NotePedal",
         ckpt_path: Path | None = None,
-        segment_samples: int = 16000 * 10,
         device: str = "cuda",
+        infer_batch: int = 1,
     ):
         """Class for transcribing piano solo recording."""
         if ckpt_path is None:
@@ -24,16 +29,15 @@ class PianoTranscription(object):
                 / "piano_tr"
                 / "note_F1=0.9677_pedal_F1=0.9186.pth"
             )
-        print(f"Checkpoint path: {ckpt_path}")
+        logger.info("Checkpoint path: %s", ckpt_path)
         if not ckpt_path.is_file():
-            os.makedirs(ckpt_path.parent, exist_ok=True)
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             zenodo_path = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
-            torch.hub.download_url_to_file(zenodo_path, ckpt_path, progress=True)
+            torch.hub.download_url_to_file(
+                zenodo_path, ckpt_path.as_posix(), progress=True
+            )
 
-        print(f"Using {device} for inference")
-        self.segment_samples = segment_samples
-        self.frames_per_second = config.frames_per_second
-        self.classes_num = config.classes_num
+        self.infer_batch = infer_batch
         self.onset_threshold = 0.3
         self.offset_threshod = 0.3
         self.frame_threshold = 0.1
@@ -41,22 +45,26 @@ class PianoTranscription(object):
 
         # Build model
         self.model = getattr(models, model_type)(
-            frames_per_second=self.frames_per_second, classes_num=self.classes_num
+            frames_per_second=params.frames_per_second, classes_num=params.classes_num
         )
-
         # Load model
         checkpoint = torch.load(ckpt_path, map_location=device)
-        self.model.load_state_dict(checkpoint["model"], strict=False)
+        self.model.load_state_dict(checkpoint["model"])
 
         # Parallel
+        logger.info("Using %s for inference", device)
         if "cuda" in str(device):
-            self.model.to(device)
-            print("GPU number: {}".format(torch.cuda.device_count()))
-            self.model = torch.nn.DataParallel(self.model)
+            # self.model.to(device)
+            logger.info("GPU number: %d", torch.cuda.device_count())
+            self.model = self.model.to(device)
         else:
-            print("Using CPU.")
+            logger.info("Using CPU.")
 
-    def transcribe(self, audio, midi_path):
+    @property
+    def segment_samples(self):
+        return int(params.sample_rate * params.segment_seconds)
+
+    def transcribe(self, audio: np.ndarray | str | Path, midi_path):
         """Transcribe an audio recording.
 
         Args:
@@ -67,38 +75,28 @@ class PianoTranscription(object):
           transcribed_dict, dict: {'output_dict':, ..., 'est_note_events': ...}
 
         """
+        if isinstance(audio, (str, Path)):
+            audio, _ = librosa.load(audio, sr=params.sample_rate, mono=True)
         audio = audio[None, :]  # (1, audio_samples)
 
-        # Pad audio to be evenly divided by segment_samples
-        audio_len = audio.shape[1]
-        pad_len = (
-            int(np.ceil(audio_len / self.segment_samples)) * self.segment_samples
-            - audio_len
-        )
-
-        audio = np.concatenate((audio, np.zeros((1, pad_len))), axis=1)
-
         # Enframe to segments
-        segments = self.enframe(audio, self.segment_samples)
-        """(N, segment_samples)"""
-
+        audio_len = audio.shape[1]
+        segments = self.enframe(audio)
         # Forward
-        output_dict = forward(self.model, segments, batch_size=1)
-        """{'reg_onset_output': (N, segment_frames, classes_num), ...}"""
-
+        output_dict = self.batched_forward(segments, batch_size=self.infer_batch)
         # Deframe to original length
         for key in output_dict.keys():
             output_dict[key] = self.deframe(output_dict[key])[0:audio_len]
-        """output_dict: {
-          'reg_onset_output': (N, segment_frames, classes_num), 
-          'reg_offset_output': (N, segment_frames, classes_num), 
-          'frame_output': (N, segment_frames, classes_num), 
-          'velocity_output': (N, segment_frames, classes_num)}"""
+        # output_dict: {
+        #   'reg_onset_output': (N, segment_frames, classes_num),
+        #   'reg_offset_output': (N, segment_frames, classes_num),
+        #   'frame_output': (N, segment_frames, classes_num),
+        #   'velocity_output': (N, segment_frames, classes_num)}
 
         # Post processor
         post_processor = RegressionPostProcessor(
-            self.frames_per_second,
-            classes_num=self.classes_num,
+            params.frames_per_second,
+            classes_num=params.classes_num,
             onset_threshold=self.onset_threshold,
             offset_threshold=self.offset_threshod,
             frame_threshold=self.frame_threshold,
@@ -118,36 +116,36 @@ class PianoTranscription(object):
                 pedal_events=est_pedal_events,
                 midi_path=midi_path,
             )
-            print("Write out to {}".format(midi_path))
+            logger.info("Write out to %s", midi_path)
 
-        transcribed_dict = {
+        return {
             "output_dict": output_dict,
             "est_note_events": est_note_events,
             "est_pedal_events": est_pedal_events,
         }
 
-        return transcribed_dict
-
-    def enframe(self, x, segment_samples):
+    def enframe(self, audio):
         """Enframe long sequence to short segments.
 
         Args:
           x: (1, audio_samples)
-          segment_samples: int
 
         Returns:
           batch: (N, segment_samples)
         """
-        assert x.shape[1] % segment_samples == 0
+        # Pad audio to be evenly divided by segment_samples
+        audio_len = audio.shape[1]
+        ss = self.segment_samples
+        pad_len = int(np.ceil(audio_len / ss)) * ss - audio_len
+        audio = np.concatenate((audio, np.zeros((1, pad_len))), axis=1)
+        assert audio.shape[1] % self.segment_samples == 0
+
         batch = []
-
         pointer = 0
-        while pointer + segment_samples <= x.shape[1]:
-            batch.append(x[:, pointer : pointer + segment_samples])
-            pointer += segment_samples // 2
-
-        batch = np.concatenate(batch, axis=0)
-        return batch
+        while pointer + ss <= audio.shape[1]:
+            batch.append(audio[:, pointer : pointer + ss])
+            pointer += ss // 2
+        return np.concatenate(batch, axis=0)
 
     def deframe(self, x):
         """Deframe predicted segments to original sequence.
@@ -160,20 +158,41 @@ class PianoTranscription(object):
         """
         if x.shape[0] == 1:
             return x[0]
+        x = x[:, 0:-1, :]
+        """Remove an extra frame in the end of each segment caused by the
+        'center=True' argument when calculating spectrogram."""
+        (N, segment_samples, _) = x.shape
+        assert segment_samples % 4 == 0
 
-        else:
-            x = x[:, 0:-1, :]
-            """Remove an extra frame in the end of each segment caused by the
-            'center=True' argument when calculating spectrogram."""
-            (N, segment_samples, classes_num) = x.shape
-            assert segment_samples % 4 == 0
+        y = []
+        y.append(x[0, 0 : int(segment_samples * 0.75)])
+        for i in range(1, N - 1):
+            y.append(x[i, int(segment_samples * 0.25) : int(segment_samples * 0.75)])
+        y.append(x[-1, int(segment_samples * 0.25) :])
+        y = np.concatenate(y, axis=0)
+        return y
 
-            y = []
-            y.append(x[0, 0 : int(segment_samples * 0.75)])
-            for i in range(1, N - 1):
-                y.append(
-                    x[i, int(segment_samples * 0.25) : int(segment_samples * 0.75)]
-                )
-            y.append(x[-1, int(segment_samples * 0.25) :])
-            y = np.concatenate(y, axis=0)
-            return y
+    @torch.no_grad()
+    def batched_forward(self, x: np.ndarray, batch_size: int) -> dict[str, np.ndarray]:
+        """Forward data to model in mini-batch.
+
+        Returns:
+        output_dict: dict, e.g. {
+            'frame_output': (segments_num, frames_num, classes_num),
+            'onset_output': (segments_num, frames_num, classes_num),
+            ...}
+        """
+
+        output_dict = defaultdict(list)
+        device = next(self.model.parameters()).device
+        self.model.eval()
+        xt = torch.from_numpy(x).float()
+        for begin in trange(0, len(x), batch_size):
+            batch = xt[begin : begin + batch_size].to(device)
+            batch_output_dict = self.model(batch)
+            for key in batch_output_dict.keys():
+                output_dict[key].append(batch_output_dict[key].cpu())
+        return {
+            key: torch.cat(output_dict[key], dim=0).numpy()
+            for key in output_dict.keys()
+        }

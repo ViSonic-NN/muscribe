@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchlibrosa.stft import LogmelFilterBank, Spectrogram
 
+from .. import params
+
 
 def init_layer(layer):
     """Initialize a Linear or Convolutional layer."""
@@ -50,9 +52,8 @@ def init_gru(rnn):
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, momentum):
+    def __init__(self, in_channels: int, out_channels: int, momentum: float):
         super(ConvBlock, self).__init__()
-
         self.conv1 = nn.Conv2d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -61,7 +62,6 @@ class ConvBlock(nn.Module):
             padding=(1, 1),
             bias=False,
         )
-
         self.conv2 = nn.Conv2d(
             in_channels=out_channels,
             out_channels=out_channels,
@@ -70,10 +70,9 @@ class ConvBlock(nn.Module):
             padding=(1, 1),
             bias=False,
         )
-
         self.bn1 = nn.BatchNorm2d(out_channels, momentum)
         self.bn2 = nn.BatchNorm2d(out_channels, momentum)
-
+        self.pool = nn.AvgPool2d(kernel_size=(1, 2))
         self.init_weight()
 
     def init_weight(self):
@@ -82,7 +81,7 @@ class ConvBlock(nn.Module):
         init_bn(self.bn1)
         init_bn(self.bn2)
 
-    def forward(self, input, pool_size=(2, 2), pool_type="avg"):
+    def forward(self, input):
         """
         Args:
           input: (batch_size, in_channels, time_steps, freq_bins)
@@ -92,11 +91,7 @@ class ConvBlock(nn.Module):
 
         x = F.relu_(self.bn1(self.conv1(input)))
         x = F.relu_(self.bn2(self.conv2(x)))
-
-        if pool_type == "avg":
-            x = F.avg_pool2d(x, kernel_size=pool_size)
-
-        return x
+        return self.pool(x)
 
 
 class AcousticModelCRnn8Dropout(nn.Module):
@@ -141,13 +136,13 @@ class AcousticModelCRnn8Dropout(nn.Module):
           output: (batch_size, time_steps, classes_num)
         """
 
-        x = self.conv_block1(input, pool_size=(1, 2), pool_type="avg")
+        x = self.conv_block1(input)
         x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block2(x, pool_size=(1, 2), pool_type="avg")
+        x = self.conv_block2(x)
         x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block3(x, pool_size=(1, 2), pool_type="avg")
+        x = self.conv_block3(x)
         x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block4(x, pool_size=(1, 2), pool_type="avg")
+        x = self.conv_block4(x)
         x = F.dropout(x, p=0.2, training=self.training)
 
         x = x.transpose(1, 2).flatten(2)
@@ -160,53 +155,17 @@ class AcousticModelCRnn8Dropout(nn.Module):
         return output
 
 
-class Regress_onset_offset_frame_velocity_CRNN(nn.Module):
-    def __init__(self, frames_per_second, classes_num):
-        super(Regress_onset_offset_frame_velocity_CRNN, self).__init__()
-
-        sample_rate = 16000
-        window_size = 2048
-        hop_size = sample_rate // frames_per_second
-        mel_bins = 229
-        fmin = 30
-        fmax = sample_rate // 2
-
-        window = "hann"
-        center = True
-        pad_mode = "reflect"
-        ref = 1.0
-        amin = 1e-10
-        top_db = None
+class RegressOnsetOffsetFrameVelocityCRNN(nn.Module):
+    def __init__(self, frames_per_second: int, classes_num: int):
+        super(RegressOnsetOffsetFrameVelocityCRNN, self).__init__()
+        (
+            self.spectrogram_extractor,
+            self.logmel_extractor,
+            self.bn0,
+        ) = make_extraction_layers(frames_per_second)
 
         midfeat = 1792
         momentum = 0.01
-
-        # Spectrogram extractor
-        self.spectrogram_extractor = Spectrogram(
-            n_fft=window_size,
-            hop_length=hop_size,
-            win_length=window_size,
-            window=window,
-            center=center,
-            pad_mode=pad_mode,
-            freeze_parameters=True,
-        )
-
-        # Logmel feature extractor
-        self.logmel_extractor = LogmelFilterBank(
-            sr=sample_rate,
-            n_fft=window_size,
-            n_mels=mel_bins,
-            fmin=fmin,
-            fmax=fmax,
-            ref=ref,
-            amin=amin,
-            top_db=top_db,
-            freeze_parameters=True,
-        )
-
-        self.bn0 = nn.BatchNorm2d(mel_bins, momentum)
-
         self.frame_model = AcousticModelCRnn8Dropout(classes_num, midfeat, momentum)
         self.reg_onset_model = AcousticModelCRnn8Dropout(classes_num, midfeat, momentum)
         self.reg_offset_model = AcousticModelCRnn8Dropout(
@@ -257,24 +216,17 @@ class Regress_onset_offset_frame_velocity_CRNN(nn.Module):
             'velocity_output': (batch_size, time_steps, classes_num)
           }
         """
+        # (batch_size, 1, time_steps, freq_bins)
+        x = self.logmel_extractor(self.spectrogram_extractor(input))
+        # BN over the freq_bins dim
+        x = self.bn0(x.transpose(1, 3)).transpose(1, 3)
 
-        x = self.spectrogram_extractor(input)  # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)  # (batch_size, 1, time_steps, mel_bins)
-
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-
-        frame_output = self.frame_model(x)  # (batch_size, time_steps, classes_num)
-        reg_onset_output = self.reg_onset_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
-        reg_offset_output = self.reg_offset_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
-        velocity_output = self.velocity_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
+        # frame_output, reg_onset_output, reg_offset_output, velocity_output:
+        # (batch_size, time_steps, classes_num)
+        frame_output = self.frame_model(x)
+        reg_onset_output = self.reg_onset_model(x)
+        reg_offset_output = self.reg_offset_model(x)
+        velocity_output = self.velocity_model(x)
 
         # Use velocities to condition onset regression
         x = torch.cat(
@@ -283,8 +235,8 @@ class Regress_onset_offset_frame_velocity_CRNN(nn.Module):
         )
         (x, _) = self.reg_onset_gru(x)
         x = F.dropout(x, p=0.5, training=self.training, inplace=False)
+        # reg_onset_output: (batch_size, time_steps, classes_num)
         reg_onset_output = torch.sigmoid(self.reg_onset_fc(x))
-        """(batch_size, time_steps, classes_num)"""
 
         # Use onsets and offsets to condition frame-wise classification
         x = torch.cat(
@@ -292,68 +244,28 @@ class Regress_onset_offset_frame_velocity_CRNN(nn.Module):
         )
         (x, _) = self.frame_gru(x)
         x = F.dropout(x, p=0.5, training=self.training, inplace=False)
-        frame_output = torch.sigmoid(
-            self.frame_fc(x)
-        )  # (batch_size, time_steps, classes_num)
-        """(batch_size, time_steps, classes_num)"""
-
-        output_dict = {
+        # frame_output: (batch_size, time_steps, classes_num)
+        frame_output = torch.sigmoid(self.frame_fc(x))
+        return {
             "reg_onset_output": reg_onset_output,
             "reg_offset_output": reg_offset_output,
             "frame_output": frame_output,
             "velocity_output": velocity_output,
         }
 
-        return output_dict
 
-
-class Regress_pedal_CRNN(nn.Module):
-    def __init__(self, frames_per_second, classes_num):
-        super(Regress_pedal_CRNN, self).__init__()
-
-        sample_rate = 16000
-        window_size = 2048
-        hop_size = sample_rate // frames_per_second
-        mel_bins = 229
-        fmin = 30
-        fmax = sample_rate // 2
-
-        window = "hann"
-        center = True
-        pad_mode = "reflect"
-        ref = 1.0
-        amin = 1e-10
-        top_db = None
+class RegressPedalCRNN(nn.Module):
+    def __init__(self, frames_per_second: int):
+        super(RegressPedalCRNN, self).__init__()
+        # Spectrogram extractor
+        (
+            self.spectrogram_extractor,
+            self.logmel_extractor,
+            self.bn0,
+        ) = make_extraction_layers(frames_per_second)
 
         midfeat = 1792
         momentum = 0.01
-
-        # Spectrogram extractor
-        self.spectrogram_extractor = Spectrogram(
-            n_fft=window_size,
-            hop_length=hop_size,
-            win_length=window_size,
-            window=window,
-            center=center,
-            pad_mode=pad_mode,
-            freeze_parameters=True,
-        )
-
-        # Logmel feature extractor
-        self.logmel_extractor = LogmelFilterBank(
-            sr=sample_rate,
-            n_fft=window_size,
-            n_mels=mel_bins,
-            fmin=fmin,
-            fmax=fmax,
-            ref=ref,
-            amin=amin,
-            top_db=top_db,
-            freeze_parameters=True,
-        )
-
-        self.bn0 = nn.BatchNorm2d(mel_bins, momentum)
-
         self.reg_pedal_onset_model = AcousticModelCRnn8Dropout(1, midfeat, momentum)
         self.reg_pedal_offset_model = AcousticModelCRnn8Dropout(1, midfeat, momentum)
         self.reg_pedal_frame_model = AcousticModelCRnn8Dropout(1, midfeat, momentum)
@@ -375,31 +287,21 @@ class Regress_pedal_CRNN(nn.Module):
             'velocity_output': (batch_size, time_steps, classes_num)
           }
         """
+        # (batch_size, 1, time_steps, freq_bins)
+        x = self.logmel_extractor(self.spectrogram_extractor(input))
+        # BN over the freq_bins dim
+        x = self.bn0(x.transpose(1, 3)).transpose(1, 3)
 
-        x = self.spectrogram_extractor(input)  # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)  # (batch_size, 1, time_steps, mel_bins)
-
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-
-        reg_pedal_onset_output = self.reg_pedal_onset_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
-        reg_pedal_offset_output = self.reg_pedal_offset_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
-        pedal_frame_output = self.reg_pedal_frame_model(
-            x
-        )  # (batch_size, time_steps, classes_num)
-
-        output_dict = {
+        # reg_pedal_onset_output, reg_pedal_offset_output, pedal_frame_output:
+        # (batch_size, time_steps, classes_num)
+        reg_pedal_onset_output = self.reg_pedal_onset_model(x)
+        reg_pedal_offset_output = self.reg_pedal_offset_model(x)
+        pedal_frame_output = self.reg_pedal_frame_model(x)
+        return {
             "reg_pedal_onset_output": reg_pedal_onset_output,
             "reg_pedal_offset_output": reg_pedal_offset_output,
             "pedal_frame_output": pedal_frame_output,
         }
-
-        return output_dict
 
 
 # This model is not trained, but is combined from the trained note and pedal models.
@@ -408,20 +310,54 @@ class NotePedal(nn.Module):
         """The combination of note and pedal model."""
         super(NotePedal, self).__init__()
 
-        self.note_model = Regress_onset_offset_frame_velocity_CRNN(
+        self.note_model = RegressOnsetOffsetFrameVelocityCRNN(
             frames_per_second, classes_num
         )
-        self.pedal_model = Regress_pedal_CRNN(frames_per_second, classes_num)
+        self.pedal_model = RegressPedalCRNN(frames_per_second)
 
     def load_state_dict(self, m, strict=False):
         self.note_model.load_state_dict(m["note_model"], strict=strict)
         self.pedal_model.load_state_dict(m["pedal_model"], strict=strict)
 
     def forward(self, input):
-        note_output_dict = self.note_model(input)
-        pedal_output_dict = self.pedal_model(input)
+        return {**self.note_model(input), **self.pedal_model(input)}
 
-        full_output_dict = {}
-        full_output_dict.update(note_output_dict)
-        full_output_dict.update(pedal_output_dict)
-        return full_output_dict
+
+def make_extraction_layers(fps: int):
+    window_size = 2048
+    hop_size = params.sample_rate // fps
+    mel_bins = 229
+    fmin = 30
+    fmax = params.sample_rate // 2
+
+    window = "hann"
+    center = True
+    pad_mode = "reflect"
+    ref = 1.0
+    amin = 1e-10
+    top_db = None
+
+    # Spectrogram extractor
+    spectrogram_extractor = Spectrogram(
+        n_fft=window_size,
+        hop_length=hop_size,
+        win_length=window_size,
+        window=window,
+        center=center,
+        pad_mode=pad_mode,
+        freeze_parameters=True,
+    )
+    # Logmel feature extractor
+    logmel_extractor = LogmelFilterBank(
+        sr=params.sample_rate,
+        n_fft=window_size,
+        n_mels=mel_bins,
+        fmin=fmin,
+        fmax=fmax,
+        ref=ref,
+        amin=amin,
+        top_db=top_db,  # type: ignore
+        freeze_parameters=True,
+    )
+    bn0 = nn.BatchNorm2d(mel_bins, 0.01)
+    return spectrogram_extractor, logmel_extractor, bn0

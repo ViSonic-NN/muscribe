@@ -7,7 +7,7 @@ from typing import Callable, Iterable, Iterator, NamedTuple, Sequence, TypeVar, 
 import numpy as np
 import pymusicxml as mxml
 
-from .pm2s.constants import NAME_TO_NSHARPS
+from ..constants import NAME_TO_NSHARPS
 
 T1 = TypeVar("T1")
 T2 = TypeVar("T2")

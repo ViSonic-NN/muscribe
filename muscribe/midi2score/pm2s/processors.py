@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .constants import KEYS_BY_NAME
+from ...constants import NATURAL_KEY_ORDER
 from .models import RNNHandPartModel, RNNKeySignatureModel
 
 
@@ -54,7 +54,7 @@ class RNNKeySignatureProcessor(MIDIProcessor):
         for onset, kidx in zip(onsets, key_idx):
             onset: float
             kidx: int
-            ks_cur = KEYS_BY_NAME[kidx]
+            ks_cur = NATURAL_KEY_ORDER[kidx]
             if not ks_changes or ks_changes[-1][1] != ks_cur:
                 ks_changes.append((onset, ks_cur))
         return ks_changes

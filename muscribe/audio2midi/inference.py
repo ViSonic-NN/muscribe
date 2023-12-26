@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from .. import params
+from .. import constants
 from . import models
 from .midi_writer import RegressionPostProcessor, write_events_to_midi
 
@@ -15,12 +15,18 @@ logger = logging.getLogger(__name__)
 
 
 class PianoTranscription(object):
+    ONSET_THRES = 0.3
+    OFFSET_THRES = 0.3
+    FRAME_THRES = 0.1
+    PEDAL_OFFSET_THRES = 0.2
+
     def __init__(
         self,
         model_type: str = "NotePedal",
         ckpt_path: Path | None = None,
         device: str = "cuda",
         infer_batch: int = 1,
+        fps: int = 100,
     ):
         """Class for transcribing piano solo recording."""
         if ckpt_path is None:
@@ -38,14 +44,11 @@ class PianoTranscription(object):
             )
 
         self.infer_batch = infer_batch
-        self.onset_threshold = 0.3
-        self.offset_threshod = 0.3
-        self.frame_threshold = 0.1
-        self.pedal_offset_threshold = 0.2
+        self.fps = fps
 
         # Build model
         self.model = getattr(models, model_type)(
-            frames_per_second=params.frames_per_second, classes_num=params.classes_num
+            frames_per_second=fps, classes_num=constants.N_NOTES
         )
         # Load model
         checkpoint = torch.load(ckpt_path, map_location=device)
@@ -62,7 +65,7 @@ class PianoTranscription(object):
 
     @property
     def segment_samples(self):
-        return int(params.sample_rate * params.segment_seconds)
+        return int(constants.SAMPLE_RATE * constants.SEGMENT_LEN)
 
     def transcribe(self, audio: np.ndarray | str | Path, midi_path):
         """Transcribe an audio recording.
@@ -76,7 +79,7 @@ class PianoTranscription(object):
 
         """
         if isinstance(audio, (str, Path)):
-            audio, _ = librosa.load(audio, sr=params.sample_rate, mono=True)
+            audio, _ = librosa.load(audio, sr=constants.SAMPLE_RATE, mono=True)
         audio = audio[None, :]  # (1, audio_samples)
 
         # Enframe to segments
@@ -95,12 +98,12 @@ class PianoTranscription(object):
 
         # Post processor
         post_processor = RegressionPostProcessor(
-            params.frames_per_second,
-            classes_num=params.classes_num,
-            onset_threshold=self.onset_threshold,
-            offset_threshold=self.offset_threshod,
-            frame_threshold=self.frame_threshold,
-            pedal_offset_threshold=self.pedal_offset_threshold,
+            self.fps,
+            classes_num=constants.N_NOTES,
+            onset_threshold=self.ONSET_THRES,
+            offset_threshold=self.OFFSET_THRES,
+            frame_threshold=self.FRAME_THRES,
+            pedal_offset_threshold=self.PEDAL_OFFSET_THRES,
         )
 
         # Post process output_dict to MIDI events

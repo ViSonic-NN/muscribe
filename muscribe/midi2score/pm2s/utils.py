@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from .constants import RESOLUTION
+RESOLUTION = 0.01  # quantization resolution: 0.01s = 10ms
 
 
 def get_in_features():

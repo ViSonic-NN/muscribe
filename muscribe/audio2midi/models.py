@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchlibrosa.stft import LogmelFilterBank, Spectrogram
 
-from .. import params
+from .. import constants
 
 
 def init_layer(layer):
@@ -174,7 +174,7 @@ class RegressOnsetOffsetFrameVelocityCRNN(nn.Module):
         self.velocity_model = AcousticModelCRnn8Dropout(classes_num, midfeat, momentum)
 
         self.reg_onset_gru = nn.GRU(
-            input_size=88 * 2,
+            input_size=classes_num * 2,
             hidden_size=256,
             num_layers=1,
             bias=True,
@@ -185,7 +185,7 @@ class RegressOnsetOffsetFrameVelocityCRNN(nn.Module):
         self.reg_onset_fc = nn.Linear(512, classes_num, bias=True)
 
         self.frame_gru = nn.GRU(
-            input_size=88 * 3,
+            input_size=classes_num * 3,
             hidden_size=256,
             num_layers=1,
             bias=True,
@@ -325,10 +325,10 @@ class NotePedal(nn.Module):
 
 def make_extraction_layers(fps: int):
     window_size = 2048
-    hop_size = params.sample_rate // fps
+    hop_size = constants.SAMPLE_RATE // fps
     mel_bins = 229
     fmin = 30
-    fmax = params.sample_rate // 2
+    fmax = constants.SAMPLE_RATE // 2
 
     window = "hann"
     center = True
@@ -349,7 +349,7 @@ def make_extraction_layers(fps: int):
     )
     # Logmel feature extractor
     logmel_extractor = LogmelFilterBank(
-        sr=params.sample_rate,
+        sr=constants.SAMPLE_RATE,
         n_fft=window_size,
         n_mels=mel_bins,
         fmin=fmin,

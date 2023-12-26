@@ -1,7 +1,7 @@
 import numpy as np
 from mido import Message, MetaMessage, MidiFile, MidiTrack
 
-from .. import params
+from .. import constants
 from .piano_vad import (
     note_detection_with_onset_offset_regress,
     pedal_detection_with_onset_offset_regress,
@@ -130,8 +130,6 @@ class RegressionPostProcessor(object):
         self.offset_threshold = offset_threshold
         self.frame_threshold = frame_threshold
         self.pedal_offset_threshold = pedal_offset_threshold
-        self.begin_note = params.begin_note
-        self.velocity_scale = params.velocity_scale
 
     def output_dict_to_midi_events(self, output_dict):
         """Main function. Post process model outputs to MIDI events.
@@ -353,7 +351,9 @@ class RegressionPostProcessor(object):
             )
 
             est_tuples += est_tuples_per_note
-            est_midi_notes += [piano_note + self.begin_note] * len(est_tuples_per_note)
+            est_midi_notes += [piano_note + constants.BEGIN_NOTE] * len(
+                est_tuples_per_note
+            )
 
         est_tuples = np.array(est_tuples)  # (notes, 5)
         """(notes, 5), the five columns are onset, offset, onset_shift, 
@@ -442,7 +442,7 @@ class RegressionPostProcessor(object):
                     "onset_time": est_on_off_note_vels[i][0],
                     "offset_time": est_on_off_note_vels[i][1],
                     "midi_note": int(est_on_off_note_vels[i][2]),
-                    "velocity": int(est_on_off_note_vels[i][3] * self.velocity_scale),
+                    "velocity": int(est_on_off_note_vels[i][3] * constants.MAX_VELO),
                 }
             )
 

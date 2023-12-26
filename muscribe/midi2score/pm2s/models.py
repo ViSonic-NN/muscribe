@@ -1,8 +1,11 @@
 import torch.nn as nn
 
+from ...constants import NATURAL_KEY_ORDER
 from .blocks import ConvBlock, GRUBlock, LinearOutput
-from .constants import KEY_VOCAB_SIZE
 from .utils import encode_note_sequence, get_in_features
+
+# Ignore minor keys in key signature prediction!
+KEY_VOCAB_SIZE = len(NATURAL_KEY_ORDER) // 2
 
 
 class RNNKeySignatureModel(nn.Module):

@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from ...constants import NATURAL_KEY_ORDER
+from ..constants import NATURAL_KEY_ORDER
 from .blocks import ConvBlock, GRUBlock, LinearOutput
 from .utils import encode_note_sequence, get_in_features
 

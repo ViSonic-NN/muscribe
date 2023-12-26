@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ...constants import NATURAL_KEY_ORDER
+from ..constants import NATURAL_KEY_ORDER
 from .models import RNNHandPartModel, RNNKeySignatureModel
 
 
